@@ -1,17 +1,13 @@
 """
-Evaluate a compressed Moonshine model on LibriSpeech test-clean.
+Evaluate a compressed Moonshine model on LibriSpeech.
 
-Loads a compressed model state_dict (saved by compress_moonshine.py) into a
-LiteMoonshineForConditionalGeneration model and computes Word Error Rate (WER)
-on the LibriSpeech test-clean split.
+Loads the compressed .pth state_dict directly into a MoonshineForConditionalGeneration model
+and computes Word Error Rate (WER) on LibriSpeech test-clean.
 
 Usage:
     python src/eval_moonshine.py \
         --compressed_weights lite-moonshine-moonshine-base_0.99:0.999.pth \
         --max_samples 100
-
-    # Evaluate the uncompressed baseline (no --compressed_weights):
-    python src/eval_moonshine.py --max_samples 100
 """
 
 import argparse
@@ -21,134 +17,135 @@ import sys
 import numpy as np
 import torch
 import evaluate
-import tqdm
+from tqdm import tqdm
 from datasets import load_dataset, Audio
-from transformers import AutoTokenizer, AutoFeatureExtractor, MoonshineForConditionalGeneration
+from transformers import AutoTokenizer, AutoFeatureExtractor, AutoConfig, MoonshineForConditionalGeneration
 
 # Ensure src/ is on the path for sibling module imports
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from lite_moonshine.configuration_lite_moonshine import LiteMoonshineConfig
-from lite_moonshine.modeling_lite_moonshine import LiteMoonshineForConditionalGeneration
 from normalizer import EnglishTextNormalizer
 
 
-def infer_low_rank_config(state_dict, num_layers):
-    """Infer low_rank_config from a saved state_dict by detecting LinearLowRank layers.
-
-    LinearLowRank layers have weight1 (in_features, low_rank) and weight2 (low_rank, out_features)
-    instead of a single weight matrix.
+def load_model(compressed_weights_path, model_name, device):
     """
-    low_rank_config = []
-    component_names = ["q_proj", "k_proj", "v_proj", "o_proj", "fc1", "fc2"]
+    Load the Moonshine model with compressed encoder weights.
+
+    The .pth file saved by compress_moonshine.py is a full model state_dict where
+    encoder LinearLowRank layers have weight1/weight2/bias instead of weight/bias.
+    We load the base model architecture and then override weights from the .pth.
+    """
+    print(f"Loading compressed weights from: {compressed_weights_path}")
+    state_dict = torch.load(compressed_weights_path, map_location=device, weights_only=False)
+
+    # Load config only (no model weights) to build architecture
+    config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+
+    # The compressed state_dict comes from a MoonshineForConditionalGeneration model
+    # where some encoder nn.Linear layers have been replaced with LinearLowRank.
+    # We need to instantiate a model that matches the state_dict structure.
+    # Since LinearLowRank has (weight1, weight2, bias) instead of (weight, bias),
+    # we use from_pretrained with state_dict override.
+
+    # First load the base model to get correct architecture
+    model = MoonshineForConditionalGeneration.from_pretrained(
+        model_name, trust_remote_code=True
+    )
+
+    # Now replace encoder layers that have low-rank structure
+    # Detect which layers are compressed by checking for weight1 keys
+    import torch.nn as nn
+
+    class LinearLowRank(nn.Module):
+        def __init__(self, weight1, weight2, bias):
+            super().__init__()
+            self.weight1 = nn.Parameter(weight1)
+            self.weight2 = nn.Parameter(weight2)
+            self.bias = nn.Parameter(bias)
+
+        def forward(self, x):
+            return (x @ self.weight1) @ self.weight2 + self.bias
+
+    num_layers = config.encoder_num_hidden_layers
+    component_map = {
+        "q_proj": "self_attn.q_proj",
+        "k_proj": "self_attn.k_proj",
+        "v_proj": "self_attn.v_proj",
+        "o_proj": "self_attn.o_proj",
+        "fc1": "mlp.fc1",
+        "fc2": "mlp.fc2",
+    }
 
     for i in range(num_layers):
-        layer_config = {}
-        for comp in component_names:
-            # Check if this component is a LinearLowRank (has weight1 key)
-            if comp in ("q_proj", "k_proj", "v_proj", "o_proj"):
-                key = f"model.encoder.layers.{i}.self_attn.{comp}.weight1"
-            else:
-                key = f"model.encoder.layers.{i}.mlp.{comp}.weight1"
+        layer = model.model.encoder.layers[i]
+        for comp_name, attr_path in component_map.items():
+            w1_key = f"model.encoder.layers.{i}.{attr_path}.weight1"
+            w2_key = f"model.encoder.layers.{i}.{attr_path}.weight2"
+            bias_key = f"model.encoder.layers.{i}.{attr_path}.bias"
 
-            if key in state_dict:
-                # low_rank = weight1.shape[1]
-                layer_config[comp] = state_dict[key].shape[1]
+            if w1_key in state_dict:
+                # This layer is compressed - replace with LinearLowRank
+                w1 = state_dict[w1_key]
+                w2 = state_dict[w2_key]
+                bias = state_dict[bias_key]
 
-        low_rank_config.append(layer_config)
+                low_rank_layer = LinearLowRank(w1, w2, bias)
 
-    return low_rank_config
+                # Set the attribute on the model
+                parts = attr_path.split(".")
+                obj = layer
+                for part in parts[:-1]:
+                    obj = getattr(obj, part)
+                setattr(obj, parts[-1], low_rank_layer)
 
+                # Remove these keys from state_dict so load_state_dict doesn't complain
+                del state_dict[w1_key]
+                del state_dict[w2_key]
+                del state_dict[bias_key]
 
-def load_compressed_model(model_name, compressed_weights_path, device):
-    """Load a compressed Moonshine model from a state_dict .pth file.
+                # Also remove original weight/bias keys if present
+                orig_w_key = f"model.encoder.layers.{i}.{attr_path}.weight"
+                orig_b_key = f"model.encoder.layers.{i}.{attr_path}.bias"
+                state_dict.pop(orig_w_key, None)
+                state_dict.pop(orig_b_key, None)
 
-    Infers the low_rank_config from the state_dict and creates a
-    LiteMoonshineForConditionalGeneration model with the appropriate architecture.
-    """
-    state_dict = torch.load(compressed_weights_path, map_location=device, weights_only=True)
+    # Load remaining weights (decoder, embeddings, conv layers, etc.)
+    # Use strict=False since we already handled low-rank layers
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
 
-    # Get base config from HuggingFace to determine model dimensions
-    base_config = MoonshineForConditionalGeneration.from_pretrained(
-        model_name, torch_dtype=torch.float32
-    ).config
-    num_layers = base_config.encoder_num_hidden_layers
+    # The missing keys should only be the low-rank layers we already set
+    if unexpected:
+        print(f"Warning: unexpected keys in state_dict: {unexpected[:5]}...")
 
-    # Infer which layers are compressed and their ranks
-    low_rank_config = infer_low_rank_config(state_dict, num_layers)
-
-    # Create LiteMoonshine config with low_rank_config, using ALL base config params
-    config = LiteMoonshineConfig(
-        low_rank_config=low_rank_config,
-        **base_config.to_dict(),
-    )
-
-    # Instantiate model with LinearLowRank layers
-    model = LiteMoonshineForConditionalGeneration(config)
-    model.load_state_dict(state_dict)
     model = model.to(device)
     model.eval()
-
     return model
 
 
-def load_baseline_model(model_name, device):
-    """Load the uncompressed baseline model from HuggingFace."""
-    model = MoonshineForConditionalGeneration.from_pretrained(
-        model_name, torch_dtype=torch.float32
-    ).to(device)
-    model.eval()
-    return model
-
-
-def transcribe(model, tokenizer, audio, feature_extractor):
+def transcribe(model, feature_extractor, audio, device):
     """Transcribe a single audio sample."""
-    inputs = feature_extractor(
-        audio, sampling_rate=16000, return_tensors="pt"
-    )
-    input_values = inputs["input_values"].to(model.device)
+    inputs = feature_extractor(audio, sampling_rate=16000, return_tensors="pt")
+    input_values = inputs["input_values"].to(device)
     with torch.no_grad():
         generated_ids = model.generate(input_values=input_values)
-    text = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
-    return text
-
-
-def is_target_text_in_range(ref):
-    if ref.strip() == "ignore time segment in scoring":
-        return False
-    return ref.strip() != ""
-
-
-def get_text(sample):
-    if "text" in sample:
-        return sample["text"]
-    elif "sentence" in sample:
-        return sample["sentence"]
-    elif "normalized_text" in sample:
-        return sample["normalized_text"]
-    elif "transcript" in sample:
-        return sample["transcript"]
-    elif "transcription" in sample:
-        return sample["transcription"]
-    else:
-        raise ValueError(
-            f"Expected transcript column of either 'text', 'sentence', "
-            f"'normalized_text' or 'transcript'. Got sample keys: "
-            f"{list(sample.keys())}"
-        )
+    return generated_ids
 
 
 def main(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # Load model
-    if args.compressed_weights:
-        print(f"Loading compressed model from: {args.compressed_weights}")
-        model = load_compressed_model(args.model, args.compressed_weights, device)
-    else:
-        print(f"Loading baseline (uncompressed) model: {args.model}")
-        model = load_baseline_model(args.model, device)
+    # Load compressed model
+    if not args.compressed_weights:
+        print("ERROR: --compressed_weights is required. Provide the path to the .pth file.")
+        print("Example: --compressed_weights lite-moonshine-moonshine-base_0.99:0.999.pth")
+        sys.exit(1)
+
+    if not os.path.isfile(args.compressed_weights):
+        print(f"ERROR: File not found: {args.compressed_weights}")
+        sys.exit(1)
+
+    model = load_model(args.compressed_weights, args.model, device)
 
     # Load tokenizer and feature extractor
     tokenizer = AutoTokenizer.from_pretrained(args.model)
@@ -158,20 +155,19 @@ def main(args):
     encoder_params = sum(p.numel() for p in model.model.encoder.parameters())
     decoder_params = sum(p.numel() for p in model.model.decoder.parameters())
     total_params = sum(p.numel() for p in model.parameters())
-    print(f"Encoder parameters: {encoder_params:,}")
+    print(f"\nEncoder parameters: {encoder_params:,}")
     print(f"Decoder parameters: {decoder_params:,}")
     print(f"Total parameters:   {total_params:,}")
 
     # Load LibriSpeech dataset
-    print(f"\nLoading dataset: {args.dataset} (split: {args.split})")
+    print(f"\nLoading dataset: {args.dataset} (config: {args.dataset_config}, split: {args.split})")
     dataset = load_dataset(args.dataset, args.dataset_config, split=args.split)
     dataset = dataset.cast_column("audio", Audio(sampling_rate=16000))
 
     if args.max_samples is not None and args.max_samples < len(dataset):
         dataset = dataset.select(range(args.max_samples))
-        print(f"Evaluating on {args.max_samples} samples")
-    else:
-        print(f"Evaluating on {len(dataset)} samples")
+
+    print(f"Evaluating on {len(dataset)} samples")
 
     # Initialize text normalizer and WER metric
     normalizer = EnglishTextNormalizer()
@@ -180,24 +176,23 @@ def main(args):
     # Run inference
     all_predictions = []
     all_references = []
-    skipped = 0
 
-    print("\nRunning inference...")
-    for i in tqdm.tqdm(range(len(dataset)), desc="Evaluating"):
+    for i in tqdm(range(len(dataset)), desc="Evaluating"):
         sample = dataset[i]
         audio = sample["audio"]["array"].astype(np.float32)
 
         # Get reference text
-        ref_text = get_text(sample)
-        norm_ref = normalizer(ref_text)
+        ref_text = sample.get("text", "")
+        if not ref_text.strip():
+            continue
 
-        # Skip empty references
-        if not is_target_text_in_range(norm_ref):
-            skipped += 1
+        norm_ref = normalizer(ref_text)
+        if not norm_ref.strip():
             continue
 
         # Transcribe
-        pred_text = transcribe(model, tokenizer, audio, feature_extractor)
+        generated_ids = transcribe(model, feature_extractor, audio, device)
+        pred_text = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
         norm_pred = normalizer(pred_text)
 
         all_predictions.append(norm_pred)
@@ -215,16 +210,14 @@ def main(args):
     print("\n" + "=" * 60)
     print("EVALUATION RESULTS")
     print("=" * 60)
-    print(f"Model:             {args.model}")
-    if args.compressed_weights:
-        print(f"Compressed weights: {args.compressed_weights}")
-    print(f"Dataset:           {args.dataset} ({args.dataset_config}, {args.split})")
-    print(f"Samples evaluated: {len(all_references)}")
-    if skipped > 0:
-        print(f"Samples skipped:   {skipped}")
-    print(f"Encoder params:    {encoder_params:,}")
-    print(f"Total params:      {total_params:,}")
-    print(f"Word Error Rate:   {wer_pct}%")
+    print(f"Model:              {args.model}")
+    print(f"Compressed weights: {args.compressed_weights}")
+    print(f"Dataset:            {args.dataset} ({args.dataset_config}, {args.split})")
+    print(f"Samples evaluated:  {len(all_references)}")
+    print(f"Encoder params:     {encoder_params:,}")
+    print(f"Decoder params:     {decoder_params:,}")
+    print(f"Total params:       {total_params:,}")
+    print(f"Word Error Rate:    {wer_pct}%")
     print("=" * 60)
 
 
@@ -242,9 +235,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--compressed_weights",
         type=str,
-        default=None,
-        help="Path to compressed model state_dict .pth file. "
-             "If not provided, evaluates the uncompressed baseline.",
+        required=True,
+        help="Path to compressed model state_dict .pth file (from compress_moonshine.py)",
     )
     parser.add_argument(
         "--dataset",
@@ -268,7 +260,7 @@ if __name__ == "__main__":
         "--max_samples",
         type=int,
         default=None,
-        help="Maximum number of samples to evaluate. Evaluates all if not set.",
+        help="Maximum number of samples to evaluate (default: all)",
     )
 
     args = parser.parse_args()
