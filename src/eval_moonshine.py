@@ -77,20 +77,10 @@ def load_compressed_model(model_name, compressed_weights_path, device):
     # Infer which layers are compressed and their ranks
     low_rank_config = infer_low_rank_config(state_dict, num_layers)
 
-    # Create LiteMoonshine config with low_rank_config
+    # Create LiteMoonshine config with low_rank_config, using ALL base config params
     config = LiteMoonshineConfig(
         low_rank_config=low_rank_config,
-        hidden_size=base_config.hidden_size,
-        intermediate_size=base_config.intermediate_size,
-        encoder_num_hidden_layers=base_config.encoder_num_hidden_layers,
-        decoder_num_hidden_layers=base_config.decoder_num_hidden_layers,
-        encoder_num_attention_heads=base_config.encoder_num_attention_heads,
-        decoder_num_attention_heads=base_config.decoder_num_attention_heads,
-        vocab_size=base_config.vocab_size,
-        pad_token_id=base_config.pad_token_id,
-        bos_token_id=base_config.bos_token_id,
-        eos_token_id=base_config.eos_token_id,
-        decoder_start_token_id=base_config.decoder_start_token_id,
+        **base_config.to_dict(),
     )
 
     # Instantiate model with LinearLowRank layers
