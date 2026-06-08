@@ -111,13 +111,13 @@ def apply_low_rank(model, dataset, rank_threshold, tokenizer, feature_extractor,
                 linear_module = layer.mlp.fc2
 
             # Concatenate collected activations
-            features = torch.cat(
-                calibration_data[i_layer][comp_name],
-                dim=0,
-            )
-            # Reshape to 2D: (total_tokens, out_features)
-            if features.dim() == 3:
-                features = features.reshape(-1, features.shape[-1])
+            # Each tensor may have different seq_len due to variable-length audio,
+            # so flatten each to 2D (tokens, features) before concatenating.
+            flattened = []
+            for feat in calibration_data[i_layer][comp_name]:
+                # feat shape: (batch, seq_len, out_features) or (seq_len, out_features)
+                flattened.append(feat.reshape(-1, feat.shape[-1]))
+            features = torch.cat(flattened, dim=0)
 
             # Determine threshold
             if ":" in rank_threshold:
