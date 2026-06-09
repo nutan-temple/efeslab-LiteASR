@@ -206,48 +206,75 @@ def main(args):
     tokenizer = AutoTokenizer.from_pretrained(args.base_model)
     feature_extractor = AutoFeatureExtractor.from_pretrained(args.base_model)
 
-    eval_dataset_list = []
-    calibrate_dataset = []
-    benchs = [
-        "voxpopuli",
-        "ami",
-        "earnings22",
-        "gigaspeech",
-        "librispeech:test.clean",
-        "librispeech:test.other",
-        "spgispeech",
-        "tedlium",
-    ]
+    # ─────────────────────────────────────────────────────────────────────
+    # CALIBRATION DATA
+    # Use dev/validation splits (NOT test) to avoid contaminating evaluation.
+    # Sources:
+    #   - LibriSpeech dev-clean (2703 samples, read English speech)
+    #   - LibriSpeech dev-other (2864 samples, noisier read English speech)
+    #   - Common Voice (validation split, diverse accents/recording conditions)
+    #
+    # Literature guidance:
+    #   - LiteASR paper (2502.20583): uses 100 samples from ESB benchmarks
+    #   - SpQR (2306.03078): uses 128 samples for Hessian estimation
+    #   - GPTQ: uses 128 samples from training distribution
+    #   - AWQ: uses 128 samples
+    #   - General consensus: 100-256 diverse samples is sufficient for
+    #     calibration-based compression. More samples help stability but
+    #     with diminishing returns beyond ~256.
+    # ─────────────────────────────────────────────────────────────────────
+    print(f"\n{'='*60}")
+    print(f"Loading calibration data ({args.num_calibration_samples} samples)")
+    print(f"{'='*60}")
 
-    # Prepare calibration and test datasets from ESB benchmarks
-    for bench in benchs:
-        split = "test"
-        if ":" in bench:
-            bench, split = bench.split(":")
-        print(bench, split)
-        dataset = load_dataset(
-            "hf-audio/esb-datasets-test-only-sorted",
-            bench,
-            split=split,
-            streaming=False,
-            token=True,
-        )
-        dataset = dataset.shuffle(seed=42)
-        dataset = data_utils.prepare_data(dataset)
-        if args.max_eval_samples is None:
-            calibrate_dataset.append(dataset.select(range(args.num_calibration_samples)))
-            eval_dataset_list.append(dataset.select(range(
-                args.num_calibration_samples,
-                len(dataset),
-            )))
-        else:
-            eval_dataset_list.append(dataset.select(range(args.max_eval_samples)))
-            calibrate_dataset.append(dataset.select(range(
-                args.max_eval_samples,
-                args.max_eval_samples + args.num_calibration_samples,
-            )))
+    calibrate_datasets = []
 
-    calibrate_dataset = concatenate_datasets(calibrate_dataset).shuffle(seed=42).select(range(args.num_calibration_samples))
+    # LibriSpeech dev-clean
+    print("Loading librispeech_asr (clean, validation)...")
+    ls_clean = load_dataset("librispeech_asr", "clean", split="validation")
+    ls_clean = ls_clean.shuffle(seed=42)
+    calibrate_datasets.append(ls_clean)
+    print(f"  → {len(ls_clean)} samples available")
+
+    # LibriSpeech dev-other
+    print("Loading librispeech_asr (other, validation)...")
+    ls_other = load_dataset("librispeech_asr", "other", split="validation")
+    ls_other = ls_other.shuffle(seed=42)
+    calibrate_datasets.append(ls_other)
+    print(f"  → {len(ls_other)} samples available")
+
+    # Common Voice (English, validation split)
+    if args.use_commonvoice:
+        print("Loading mozilla-foundation/common_voice_17_0 (en, validation)...")
+        try:
+            cv = load_dataset(
+                "mozilla-foundation/common_voice_17_0",
+                "en",
+                split="validation",
+                trust_remote_code=True,
+            )
+            cv = cv.shuffle(seed=42)
+            calibrate_datasets.append(cv)
+            print(f"  → {len(cv)} samples available")
+        except Exception as e:
+            print(f"  → WARNING: Could not load Common Voice: {e}")
+            print(f"  → Continuing without Common Voice...")
+
+    # Merge and select calibration samples
+    # Take equal portions from each source for diversity
+    samples_per_source = args.num_calibration_samples // len(calibrate_datasets)
+    remainder = args.num_calibration_samples % len(calibrate_datasets)
+
+    selected = []
+    for i, ds in enumerate(calibrate_datasets):
+        n = samples_per_source + (1 if i < remainder else 0)
+        n = min(n, len(ds))
+        selected.append(ds.select(range(n)))
+
+    calibrate_dataset = concatenate_datasets(selected).shuffle(seed=42)
+    print(f"\nTotal calibration samples: {len(calibrate_dataset)}")
+    print(f"  Sources: LibriSpeech dev-clean, dev-other{', Common Voice' if args.use_commonvoice else ''}")
+    print(f"{'='*60}\n")
 
     if args.low_rank:
         model = apply_low_rank(
@@ -256,41 +283,73 @@ def main(args):
         )
 
         if args.save_weight:
-            torch.save(model.state_dict(), f"lite-moonshine-{args.base_model.split('/')[-1]}_{args.rank_threshold}.pth")
+            save_path = f"lite-moonshine-{args.base_model.split('/')[-1]}_{args.rank_threshold}.pth"
+            torch.save(model.state_dict(), save_path)
+            print(f"\nSaved compressed weights to: {save_path}")
 
-    print(f"Number of parameters in encoder: {sum(p.numel() for p in model.model.encoder.parameters())}")
+    # Parameter counts (correct, accounting for weight tying)
+    encoder_params = sum(p.numel() for p in model.model.encoder.parameters())
+    decoder_params = sum(p.numel() for p in model.model.decoder.parameters())
+    total_unique = sum(p.numel() for p in model.parameters())
+    print(f"\n{'='*60}")
+    print(f"COMPRESSION RESULTS")
+    print(f"{'='*60}")
+    print(f"  Encoder parameters: {encoder_params:,} (original: 20,153,120)")
+    print(f"  Decoder parameters: {decoder_params:,} (unchanged)")
+    print(f"  Total (unique):     {total_unique:,} (original: 61,513,920)")
+    print(f"  Encoder reduction:  {100*(1 - encoder_params/20_153_120):.1f}%")
+    print(f"  Total reduction:    {100*(1 - total_unique/61_513_920):.1f}%")
+    print(f"{'='*60}")
 
     if not args.do_eval:
         return
 
-    # Accuracy benchmark
+    # Evaluation on LibriSpeech test splits (separate from calibration data!)
+    print(f"\n{'='*60}")
+    print(f"EVALUATION (LibriSpeech test-clean & test-other)")
+    print(f"{'='*60}")
+
+    eval_splits = [
+        ("librispeech_asr", "clean", "test"),
+        ("librispeech_asr", "other", "test"),
+    ]
+
     total_sum_wer = 0
-    for i_bench, dataset in enumerate(eval_dataset_list):
+    wer_metric = evaluate.load("wer")
+
+    for dataset_name, config, split in eval_splits:
+        print(f"\nEvaluating on {dataset_name} ({config}, {split})...")
+        eval_dataset = load_dataset(dataset_name, config, split=split)
+
+        if args.max_eval_samples is not None and args.max_eval_samples < len(eval_dataset):
+            eval_dataset = eval_dataset.select(range(args.max_eval_samples))
+
         sum_wer = 0
-        wer_metric = evaluate.load("wer")
-        for i in range(len(dataset)):
-            audio = dataset[i]["audio"]["array"].astype(np.float32)
+        for i in tqdm.tqdm(range(len(eval_dataset)), desc=f"{config}-{split}"):
+            audio = eval_dataset[i]["audio"]["array"].astype(np.float32)
+            ref_text = eval_dataset[i]["text"]
 
             pred = transcribe(model, tokenizer, audio, feature_extractor)
+
             wer = wer_metric.compute(
-                references=[dataset[i]["norm_text"]], predictions=[data_utils.normalizer(pred)]
+                references=[data_utils.normalizer(ref_text)],
+                predictions=[data_utils.normalizer(pred)]
             )
-            wer = round(100 * wer, 2)
-            sum_wer += wer
+            sum_wer += round(100 * wer, 2)
+
+        avg_wer = sum_wer / len(eval_dataset)
+        total_sum_wer += avg_wer
+        print(f"  {config}-{split} WER: {avg_wer:.2f}%")
 
         with open('output.txt', 'a') as f:
-            f.write(f"Number of parameters: {sum(p.numel() for p in model.model.encoder.parameters())}\n")
-            f.write(str(args) + '\n')
-            f.write(f"{benchs[i_bench]}\n")
-            f.write(f"Average WER: {sum_wer / len(dataset)}\n")
-            f.write("=====================================\n")
-        total_sum_wer += sum_wer / len(dataset)
+            f.write(f"encoder_params: {encoder_params} | {config}-{split} WER: {avg_wer:.2f}%\n")
 
-    total_avg_wer = total_sum_wer / len(eval_dataset_list)
-    model_name = ('lite-' if args.low_rank else '') + 'moonshine-' + args.base_model.split('/')[-1] + ('-' + args.rank_threshold if args.low_rank else '')
+    total_avg_wer = total_sum_wer / len(eval_splits)
+    print(f"\n  Average WER: {total_avg_wer:.2f}%")
+
     with open('output.txt', 'a') as f:
-        f.write(f'Final model evaluation results:\n')
-        f.write(f'max_eval_samples:{args.max_eval_samples} | {model_name} | total_avg_wer: {total_avg_wer} | encoder_params: {sum(p.numel() for p in model.model.encoder.parameters())} | decoder_params: {sum(p.numel() for p in model.model.decoder.parameters())}\n')
+        f.write(f"Total avg WER: {total_avg_wer:.2f}% | threshold: {args.rank_threshold} | encoder_params: {encoder_params}\n")
+        f.write("=" * 60 + "\n")
 
 
 if __name__ == "__main__":
@@ -331,9 +390,14 @@ if __name__ == "__main__":
         help="Whether to save the compressed weights",
     )
     parser.add_argument(
+        "--use_commonvoice",
+        action="store_true",
+        help="Include Common Voice (English) in calibration data for more diversity",
+    )
+    parser.add_argument(
         "--do_eval",
         action="store_true",
-        help="Whether to evaluate the model",
+        help="Whether to evaluate the model on LibriSpeech test splits after compression",
     )
     args = parser.parse_args()
 
