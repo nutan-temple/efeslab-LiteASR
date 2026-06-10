@@ -1,49 +1,17 @@
 """
 Evaluate compressed Moonshine models on the AI4Bharat Svarah dataset.
 
-Svarah is a gated dataset - you need to:
-1. Go to https://huggingface.co/datasets/ai4bharat/Svarah
-2. Accept the license agreement
-3. Login: huggingface-cli login (paste your HF token)
-
-Dataset structure (ai4bharat/Svarah):
-  - audio: Audio column (wav/flac)
-  - transcript: Ground truth transcription
-  - language: Language label
-  - speaker_id: Speaker identifier
-  - duration: Audio duration in seconds
+Based on the working reference script that achieves 16% WER baseline.
 
 Usage:
-    # Evaluate compressed model on Svarah:
-    python src/eval_svarah.py \
-        --compressed_weights lite-moonshine-moonshine-base_0.95:0.98.pth
-
-    # Evaluate baseline (uncompressed):
-    python src/eval_svarah.py --baseline
-
-    # Compare multiple models:
-    python src/eval_svarah.py \
-        --compressed_weights \
-            lite-moonshine-moonshine-base_0.99:0.999.pth \
-            lite-moonshine-moonshine-base_0.95:0.98.pth \
-        --baseline
-
-    # Quick test (100 samples):
-    python src/eval_svarah.py \
-        --compressed_weights lite-moonshine-moonshine-base_0.95:0.98.pth \
-        --max_samples 100
-
-    # Filter by language (if Svarah has multiple):
-    python src/eval_svarah.py \
-        --compressed_weights lite-moonshine-moonshine-base_0.95:0.98.pth \
-        --language english
+    python src/eval_svarah.py --baseline --max_samples 100
+    python src/eval_svarah.py --compressed_weights model1.pth model2.pth --baseline
 """
 
 import argparse
 import os
 import sys
 import json
-import re
 import time
 from datetime import datetime
 
@@ -52,20 +20,18 @@ import torch
 import torch.nn as nn
 import evaluate
 from tqdm import tqdm
-from datasets import load_dataset, Audio
-from transformers import (
-    AutoTokenizer,
-    AutoFeatureExtractor,
-    MoonshineForConditionalGeneration,
-)
+from datasets import load_dataset
+from transformers import MoonshineForConditionalGeneration, AutoProcessor
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from normalizer import EnglishTextNormalizer
+
+
+# ── Config ────────────────────────────────────────────────────────────────────
+SAMPLE_RATE = 16000
+TOKEN_LIMIT_FACTOR = 6.5 / SAMPLE_RATE
 
 
 class LinearLowRank(nn.Module):
-    """Low-rank layer: forward(x) = (x @ weight1) @ weight2 + bias"""
-
     def __init__(self, weight1, weight2, bias):
         super().__init__()
         self.weight1 = nn.Parameter(weight1)
@@ -79,9 +45,7 @@ class LinearLowRank(nn.Module):
 def load_compressed_model(compressed_weights_path, model_name, device, torch_dtype):
     """Load model with compressed encoder from .pth + original decoder from HuggingFace."""
     print(f"  Loading original model from: {model_name}")
-    model = MoonshineForConditionalGeneration.from_pretrained(
-        model_name, trust_remote_code=True
-    )
+    model = MoonshineForConditionalGeneration.from_pretrained(model_name)
     config = model.config
 
     print(f"  Loading compressed weights from: {compressed_weights_path}")
@@ -101,11 +65,8 @@ def load_compressed_model(compressed_weights_path, model_name, device, torch_dty
         "self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj",
         "self_attn.o_proj", "mlp.fc1", "mlp.fc2",
     ]
-
-    num_layers = config.encoder_num_hidden_layers
     replaced = 0
-
-    for i in range(num_layers):
+    for i in range(config.encoder_num_hidden_layers):
         layer = model.model.encoder.layers[i]
         for attr_path in component_paths:
             w1_key = f"encoder.layers.{i}.{attr_path}.weight1"
@@ -116,7 +77,6 @@ def load_compressed_model(compressed_weights_path, model_name, device, torch_dty
                 w1 = encoder_sd.pop(w1_key)
                 w2 = encoder_sd.pop(w2_key)
                 bias = encoder_sd.pop(bias_key)
-
                 low_rank_layer = LinearLowRank(w1, w2, bias)
 
                 parts = attr_path.split(".")
@@ -125,12 +85,9 @@ def load_compressed_model(compressed_weights_path, model_name, device, torch_dty
                     obj = getattr(obj, part)
                 setattr(obj, parts[-1], low_rank_layer)
                 replaced += 1
-
                 encoder_sd.pop(f"encoder.layers.{i}.{attr_path}.weight", None)
 
     print(f"  Replaced {replaced} layers with LinearLowRank")
-
-    # Load remaining encoder weights
     model.model.load_state_dict(encoder_sd, strict=False)
     model = model.to(device).to(torch_dtype)
     model.eval()
@@ -140,168 +97,53 @@ def load_compressed_model(compressed_weights_path, model_name, device, torch_dty
 def load_baseline_model(model_name, device, torch_dtype):
     """Load the original uncompressed model."""
     print(f"  Loading baseline model from: {model_name}")
-    model = MoonshineForConditionalGeneration.from_pretrained(
-        model_name, trust_remote_code=True
-    )
+    model = MoonshineForConditionalGeneration.from_pretrained(model_name)
     model = model.to(device).to(torch_dtype)
     model.eval()
     return model
 
 
-def detect_text_column(dataset):
-    """Detect which column holds the transcription text."""
-    cols = dataset.column_names
-    # Priority order for text column detection
-    candidates = ["transcript", "transcription", "text", "sentence", "normalized_text"]
-    for candidate in candidates:
-        if candidate in cols:
-            return candidate
-    raise ValueError(
-        f"Could not detect text column. Available columns: {cols}\n"
-        f"Expected one of: {candidates}"
-    )
+def transcribe_sample(model, processor, audio_array, device, torch_dtype):
+    """Transcribe one audio sample. Matches reference script exactly."""
+    inputs = processor(audio_array, return_tensors="pt", sampling_rate=SAMPLE_RATE)
+    inputs = inputs.to(device, torch_dtype)
+
+    # Dynamic max_length based on audio duration (prevents repetition loops)
+    seq_lens = inputs.attention_mask.sum(dim=-1)
+    max_length = int((seq_lens * TOKEN_LIMIT_FACTOR).max().item())
+    max_length = max(max_length, 10)
+
+    generated_ids = model.generate(**inputs, max_length=max_length)
+    return processor.decode(generated_ids[0], skip_special_tokens=True)
 
 
-def load_svarah(args):
-    """Load the Svarah dataset with proper authentication."""
-    print("\nLoading Svarah dataset (ai4bharat/Svarah)...")
-    print("  Note: This is a gated dataset. Make sure you have:")
-    print("  1. Accepted the license at https://huggingface.co/datasets/ai4bharat/Svarah")
-    print("  2. Run: huggingface-cli login")
-    print()
-
-    try:
-        ds = load_dataset("ai4bharat/Svarah", split="test", streaming=True)
-    except Exception as e:
-        if "gated" in str(e).lower() or "authentication" in str(e).lower() or "401" in str(e):
-            print("ERROR: Authentication required for Svarah dataset.")
-            print("Run: huggingface-cli login")
-            print("Then accept the license at: https://huggingface.co/datasets/ai4bharat/Svarah")
-            sys.exit(1)
-        else:
-            raise
-
-    # Convert streaming dataset to list for indexed access
-    print(f"  Loading samples from streaming dataset...")
-    samples = []
-    for count, sample in enumerate(ds):
-        if args.max_samples and count >= args.max_samples:
-            break
-        samples.append(sample)
-
-    print(f"  Loaded {len(samples)} samples")
-    print(f"  Sample keys: {list(samples[0].keys()) if samples else 'N/A'}")
-    if samples:
-        print(f"  Sample text[0]: '{str(samples[0].get('text', 'N/A'))[:80]}'")
-        print(f"  audio_filepath type: {type(samples[0].get('audio_filepath', None))}")
-
-    # Detect text column from sample keys
-    sample_keys = list(samples[0].keys()) if samples else []
-    candidates = ["transcript", "transcription", "text", "sentence", "normalized_text"]
-    text_key = "text"  # default
-    for c in candidates:
-        if c in sample_keys:
-            text_key = c
-            break
-    print(f"  Using text column: '{text_key}'")
-
-    # Filter by language if specified
-    if args.language:
-        lang_col = None
-        for col in ["primary_language", "language", "lang", "locale"]:
-            if col in sample_keys:
-                lang_col = col
-                break
-
-        if lang_col:
-            unique_langs = set(str(s.get(lang_col, "")) for s in samples[:200])
-            print(f"  Available languages (sample): {sorted(unique_langs)}")
-            samples = [s for s in samples if args.language.lower() in str(s.get(lang_col, "")).lower()]
-            print(f"  Filtered to '{args.language}': {len(samples)} samples")
-        else:
-            print(f"  Warning: No language column found, using all samples")
-
-    return samples, text_key
-
-
-def simple_normalize(text):
-    """Simple text normalization that works for any language.
-
-    Unlike EnglishTextNormalizer which strips non-ASCII (killing Hindi/Indian text),
-    this just lowercases, removes extra whitespace, and strips basic punctuation.
-    """
-    if not text:
-        return ""
-    text = str(text).lower().strip()
-    # Remove common punctuation but keep letters (including non-ASCII/Devanagari)
-    text = re.sub(r'[^\w\s]', '', text)
-    # Collapse whitespace
-    text = re.sub(r'\s+', ' ', text).strip()
-    return text
-
-
-def evaluate_model_on_svarah(model, dataset, text_key, feature_extractor, tokenizer, device, output_predictions_path=None):
-    """Run inference on Svarah and compute WER.
-
-    Uses NO normalization (matching the reference script that got 16% WER).
-    Raw reference text vs raw prediction, just stripped of leading/trailing whitespace.
-
-    Also saves per-sample predictions to a JSON file for analysis.
-    """
-
+def evaluate_model_on_svarah(model, samples, text_key, processor, device, torch_dtype, output_path=None):
+    """Run inference on Svarah samples and compute WER."""
     wer_metric = evaluate.load("wer")
     all_predictions = []
     all_references = []
-    all_results_per_sample = []  # for saving to file
+    all_results_per_sample = []
     total_audio_duration = 0.0
     total_inference_time = 0.0
     errors = 0
 
-    SAMPLE_RATE = 16000
+    for i in tqdm(range(len(samples)), desc="  Transcribing"):
+        sample = samples[i]
 
-    for i in tqdm(range(len(dataset)), desc="  Transcribing"):
-        sample = dataset[i]
-
-        # ── Load audio ──────────────────────────────────────────────────
         try:
-            audio_obj = sample.get("audio_filepath") or sample.get("audio")
-
-            if audio_obj is None:
-                errors += 1
-                continue
-
-            if hasattr(audio_obj, 'get_all_samples'):
-                # torchcodec decoder format (Svarah streaming)
-                frames = audio_obj.get_all_samples()
-                audio = frames.data.squeeze(0).numpy().astype(np.float32)
-                sr = frames.sample_rate
-            elif isinstance(audio_obj, dict) and "array" in audio_obj:
-                # Standard HuggingFace Audio format
-                audio = np.array(audio_obj["array"], dtype=np.float32)
-                sr = audio_obj["sampling_rate"]
-            elif isinstance(audio_obj, dict) and "path" in audio_obj:
-                import soundfile as sf
-                audio, sr = sf.read(audio_obj["path"])
-                audio = audio.astype(np.float32)
-            elif isinstance(audio_obj, str):
-                import soundfile as sf
-                audio, sr = sf.read(audio_obj)
-                audio = audio.astype(np.float32)
-            else:
-                errors += 1
-                if errors <= 3:
-                    print(f"  Warning [{i}]: Unknown audio format: {type(audio_obj)}")
-                continue
+            # Load audio (torchcodec decoder format)
+            audio_decoder = sample["audio_filepath"]
+            frames = audio_decoder.get_all_samples()
+            audio_array = frames.data.squeeze(0).numpy()
+            sr = frames.sample_rate
 
             # Resample if needed
             if sr != SAMPLE_RATE:
-                try:
-                    import torchaudio
-                    audio_tensor = torch.tensor(audio).unsqueeze(0)
-                    audio = torchaudio.functional.resample(audio_tensor, sr, SAMPLE_RATE).squeeze().numpy()
-                except ImportError:
-                    import librosa
-                    audio = librosa.resample(audio, orig_sr=sr, target_sr=SAMPLE_RATE)
+                import torchaudio
+                audio_tensor = torch.tensor(audio_array).unsqueeze(0)
+                audio_array = torchaudio.functional.resample(
+                    audio_tensor, sr, SAMPLE_RATE
+                ).squeeze().numpy()
 
         except Exception as e:
             errors += 1
@@ -309,42 +151,31 @@ def evaluate_model_on_svarah(model, dataset, text_key, feature_extractor, tokeni
                 print(f"  Warning [{i}]: Audio load error: {e}")
             continue
 
-        # Track audio duration
-        total_audio_duration += len(audio) / SAMPLE_RATE
-
-        # ── Get reference text (NO normalization - match reference script) ──
+        # Get reference text
         ref_text = sample.get(text_key, "")
         if not ref_text or not str(ref_text).strip():
             errors += 1
             continue
-
         ref_text = str(ref_text).strip()
 
-        # ── Transcribe ──────────────────────────────────────────────────
-        try:
-            inputs = feature_extractor(audio, sampling_rate=SAMPLE_RATE, return_tensors="pt")
-            input_values = inputs["input_values"].to(device)
+        # Track audio duration
+        total_audio_duration += len(audio_array) / SAMPLE_RATE
 
+        # Transcribe
+        try:
             start_time = time.time()
-            with torch.no_grad():
-                generated_ids = model.generate(input_values=input_values)
+            pred_text = transcribe_sample(model, processor, audio_array, device, torch_dtype)
             inference_time = time.time() - start_time
             total_inference_time += inference_time
-
-            pred_text = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0].strip()
 
             all_predictions.append(pred_text)
             all_references.append(ref_text)
 
-            # Save per-sample result
-            audio_id = sample.get("audio_filepath", f"sample_{i}")
-            if hasattr(audio_id, 'get_all_samples'):
-                audio_id = f"sample_{i}"
             all_results_per_sample.append({
-                "id": str(audio_id) if isinstance(audio_id, str) else f"sample_{i}",
+                "id": f"sample_{i}",
                 "reference": ref_text,
                 "prediction": pred_text,
-                "duration": round(len(audio) / SAMPLE_RATE, 2),
+                "duration": round(len(audio_array) / SAMPLE_RATE, 2),
                 "inference_time": round(inference_time, 3),
             })
 
@@ -355,17 +186,17 @@ def evaluate_model_on_svarah(model, dataset, text_key, feature_extractor, tokeni
             continue
 
     if not all_references:
-        return {"wer": None, "samples": 0, "errors": errors, "per_sample": []}
+        return {"wer": None, "samples": 0, "errors": errors}
 
     wer = wer_metric.compute(references=all_references, predictions=all_predictions)
     wer_pct = round(100 * wer, 2)
     rtfx = round(total_audio_duration / total_inference_time, 2) if total_inference_time > 0 else None
 
-    # Save per-sample predictions to file
-    if output_predictions_path:
-        with open(output_predictions_path, "w", encoding="utf-8") as f:
+    # Save per-sample predictions
+    if output_path and all_results_per_sample:
+        with open(output_path, "w", encoding="utf-8") as f:
             json.dump(all_results_per_sample, f, indent=2, ensure_ascii=False)
-        print(f"  Predictions saved to: {output_predictions_path}")
+        print(f"  Predictions saved to: {output_path}")
 
     return {
         "wer": wer_pct,
@@ -374,20 +205,16 @@ def evaluate_model_on_svarah(model, dataset, text_key, feature_extractor, tokeni
         "audio_hours": round(total_audio_duration / 3600, 3),
         "inference_time_s": round(total_inference_time, 1),
         "rtfx": rtfx,
-        "per_sample": all_results_per_sample,
     }
 
 
 def main(args):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}\n")
-
-    # Load processor (AutoProcessor includes both tokenizer + feature extractor)
-    from transformers import AutoProcessor
-    processor = AutoProcessor.from_pretrained(args.model)
-
-    # Determine dtype (match reference script)
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+    print(f"Device: {device}, dtype: {torch_dtype}\n")
+
+    # Load processor
+    processor = AutoProcessor.from_pretrained(args.model)
 
     # Determine models to evaluate
     models_to_eval = []
@@ -404,8 +231,40 @@ def main(args):
         print("ERROR: No models to evaluate. Use --compressed_weights or --baseline")
         sys.exit(1)
 
-    # Load Svarah dataset once
-    dataset, text_key = load_svarah(args)
+    # Load Svarah dataset (streaming, matches reference script)
+    print("Loading Svarah dataset (ai4bharat/Svarah, streaming)...")
+    ds = load_dataset("ai4bharat/Svarah", split="test", streaming=True)
+
+    samples = []
+    for count, sample in enumerate(ds):
+        if args.max_samples and count >= args.max_samples:
+            break
+        samples.append(sample)
+
+    print(f"  Loaded {len(samples)} samples")
+    if samples:
+        print(f"  Keys: {list(samples[0].keys())}")
+        print(f"  text[0]: '{str(samples[0].get('text', ''))[:80]}'")
+
+    # Detect text column
+    text_key = "text"
+    if samples:
+        for candidate in ["transcript", "transcription", "text", "sentence"]:
+            if candidate in samples[0]:
+                text_key = candidate
+                break
+    print(f"  Using text column: '{text_key}'")
+
+    # Filter by language
+    if args.language and samples:
+        lang_col = None
+        for col in ["primary_language", "language", "lang"]:
+            if col in samples[0]:
+                lang_col = col
+                break
+        if lang_col:
+            samples = [s for s in samples if args.language.lower() in str(s.get(lang_col, "")).lower()]
+            print(f"  Filtered to '{args.language}': {len(samples)} samples")
 
     # Evaluate each model
     all_results = {}
@@ -420,112 +279,64 @@ def main(args):
         else:
             model = load_compressed_model(weights_path, args.model, device, torch_dtype)
 
-        # Print param counts
         encoder_params = sum(p.numel() for p in model.model.encoder.parameters())
         decoder_params = sum(p.numel() for p in model.model.decoder.parameters())
         total_params = sum(p.numel() for p in model.parameters())
         print(f"  Encoder: {encoder_params:,} | Decoder: {decoder_params:,} | Total: {total_params:,}")
 
-        # Evaluate
-        # Generate output predictions filename for this model
-        safe_model_name = model_name.replace("/", "_").replace(":", "_").replace(" ", "_")
-        predictions_path = f"predictions_svarah_{safe_model_name}.json"
+        safe_name = model_name.replace("/", "_").replace(":", "_").replace(" ", "_")
+        predictions_path = f"predictions_svarah_{safe_name}.json"
 
-        print(f"\n  Evaluating on Svarah ({len(dataset)} samples)...")
+        print(f"\n  Evaluating on Svarah ({len(samples)} samples)...")
         result = evaluate_model_on_svarah(
-            model, dataset, text_key, processor, device, torch_dtype,
-            output_predictions_path=predictions_path,
+            model, samples, text_key, processor, device, torch_dtype,
+            output_path=predictions_path,
         )
 
         all_results[model_name] = {
             "encoder_params": encoder_params,
-            "decoder_params": decoder_params,
             "total_params": total_params,
             **result,
         }
 
         if result["wer"] is not None:
             print(f"\n  WER: {result['wer']}%")
-            print(f"  Samples: {result['samples']} (errors/skipped: {result['errors']})")
+            print(f"  Samples: {result['samples']} (errors: {result['errors']})")
             if result["rtfx"]:
-                print(f"  RTFx: {result['rtfx']} ({result['audio_hours']} hours audio in {result['inference_time_s']}s)")
+                print(f"  RTFx: {result['rtfx']}x ({result['audio_hours']}h audio in {result['inference_time_s']}s)")
         else:
             print(f"  No valid samples evaluated.")
 
-        # Free memory
         del model
-        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
-    # Summary
+    # Summary table
     print(f"\n\n{'='*70}")
     print("SVARAH EVALUATION SUMMARY")
     print(f"{'='*70}")
     print(f"  {'Model':<50s} {'Enc Params':<12s} {'WER':<8s} {'RTFx':<8s}")
     print(f"  {'-'*50} {'-'*12} {'-'*8} {'-'*8}")
-
-    for model_name, result in all_results.items():
-        wer_str = f"{result['wer']:.2f}%" if result.get('wer') is not None else "N/A"
-        rtfx_str = f"{result['rtfx']:.1f}x" if result.get('rtfx') is not None else "N/A"
-        print(f"  {model_name:<50s} {result['encoder_params']:>10,}  {wer_str:<8s} {rtfx_str:<8s}")
-
+    for name, r in all_results.items():
+        wer_str = f"{r['wer']:.2f}%" if r.get('wer') else "N/A"
+        rtfx_str = f"{r['rtfx']:.1f}x" if r.get('rtfx') else "N/A"
+        print(f"  {name:<50s} {r['encoder_params']:>10,}  {wer_str:<8s} {rtfx_str:<8s}")
     print(f"{'='*70}")
 
     # Save results
     output_path = args.output or "eval_svarah_results.json"
-    results_json = {
-        "timestamp": datetime.now().isoformat(),
-        "device": str(device),
-        "base_model": args.model,
-        "dataset": "ai4bharat/Svarah",
-        "language_filter": args.language,
-        "max_samples": args.max_samples,
-        "results": all_results,
-    }
     with open(output_path, "w") as f:
-        json.dump(results_json, f, indent=2, default=str)
+        json.dump({"timestamp": datetime.now().isoformat(), "results": all_results}, f, indent=2, default=str)
     print(f"\nResults saved to: {output_path}")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Evaluate compressed Moonshine models on AI4Bharat Svarah dataset"
-    )
-    parser.add_argument(
-        "--model",
-        type=str,
-        default="usefulsensors/moonshine-base",
-        help="Base model on HuggingFace (default: usefulsensors/moonshine-base)",
-    )
-    parser.add_argument(
-        "--compressed_weights",
-        type=str,
-        nargs="+",
-        default=None,
-        help="Path(s) to .pth file(s). Can specify multiple for comparison.",
-    )
-    parser.add_argument(
-        "--baseline",
-        action="store_true",
-        help="Evaluate the original uncompressed model",
-    )
-    parser.add_argument(
-        "--language",
-        type=str,
-        default=None,
-        help="Filter Svarah by language (e.g., 'english', 'hindi'). Default: use all.",
-    )
-    parser.add_argument(
-        "--max_samples",
-        type=int,
-        default=None,
-        help="Max samples to evaluate (default: all)",
-    )
-    parser.add_argument(
-        "--output",
-        type=str,
-        default=None,
-        help="Path to save JSON results (default: eval_svarah_results.json)",
-    )
-
+    parser = argparse.ArgumentParser(description="Evaluate Moonshine on Svarah")
+    parser.add_argument("--model", type=str, default="usefulsensors/moonshine-base")
+    parser.add_argument("--compressed_weights", type=str, nargs="+", default=None)
+    parser.add_argument("--baseline", action="store_true")
+    parser.add_argument("--language", type=str, default=None)
+    parser.add_argument("--max_samples", type=int, default=None)
+    parser.add_argument("--output", type=str, default=None)
     args = parser.parse_args()
     main(args)
