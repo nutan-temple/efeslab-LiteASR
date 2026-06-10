@@ -171,7 +171,7 @@ def load_svarah(args):
     print()
 
     try:
-        ds = load_dataset("ai4bharat/Svarah", split="test")
+        ds = load_dataset("ai4bharat/Svarah", split="test", streaming=True)
     except Exception as e:
         if "gated" in str(e).lower() or "authentication" in str(e).lower() or "401" in str(e):
             print("ERROR: Authentication required for Svarah dataset.")
@@ -181,41 +181,47 @@ def load_svarah(args):
         else:
             raise
 
-    print(f"  Dataset loaded: {len(ds)} samples")
-    print(f"  Columns: {ds.column_names}")
+    # Convert streaming dataset to list for indexed access
+    print(f"  Loading samples from streaming dataset...")
+    samples = []
+    for count, sample in enumerate(ds):
+        if args.max_samples and count >= args.max_samples:
+            break
+        samples.append(sample)
 
-    # Cast audio to 16kHz
-    ds = ds.cast_column("audio", Audio(sampling_rate=16000))
+    print(f"  Loaded {len(samples)} samples")
+    print(f"  Sample keys: {list(samples[0].keys()) if samples else 'N/A'}")
+    if samples:
+        print(f"  Sample text[0]: '{str(samples[0].get('text', 'N/A'))[:80]}'")
+        print(f"  audio_filepath type: {type(samples[0].get('audio_filepath', None))}")
 
-    # Detect text column
-    text_key = detect_text_column(ds)
+    # Detect text column from sample keys
+    sample_keys = list(samples[0].keys()) if samples else []
+    candidates = ["transcript", "transcription", "text", "sentence", "normalized_text"]
+    text_key = "text"  # default
+    for c in candidates:
+        if c in sample_keys:
+            text_key = c
+            break
     print(f"  Using text column: '{text_key}'")
 
     # Filter by language if specified
     if args.language:
         lang_col = None
-        for col in ["language", "lang", "locale"]:
-            if col in ds.column_names:
+        for col in ["primary_language", "language", "lang", "locale"]:
+            if col in sample_keys:
                 lang_col = col
                 break
 
         if lang_col:
-            # Check available languages
-            unique_langs = set(ds[lang_col])
-            print(f"  Available languages: {sorted(unique_langs)}")
-
-            # Filter
-            ds = ds.filter(lambda x: args.language.lower() in x[lang_col].lower())
-            print(f"  Filtered to '{args.language}': {len(ds)} samples")
+            unique_langs = set(str(s.get(lang_col, "")) for s in samples[:200])
+            print(f"  Available languages (sample): {sorted(unique_langs)}")
+            samples = [s for s in samples if args.language.lower() in str(s.get(lang_col, "")).lower()]
+            print(f"  Filtered to '{args.language}': {len(samples)} samples")
         else:
             print(f"  Warning: No language column found, using all samples")
 
-    # Limit samples
-    if args.max_samples and args.max_samples < len(ds):
-        ds = ds.select(range(args.max_samples))
-        print(f"  Limited to {args.max_samples} samples")
-
-    return ds, text_key
+    return samples, text_key
 
 
 def simple_normalize(text):
@@ -235,7 +241,11 @@ def simple_normalize(text):
 
 
 def evaluate_model_on_svarah(model, dataset, text_key, feature_extractor, tokenizer, normalizer, device, use_simple_norm=False):
-    """Run inference on Svarah and compute WER."""
+    """Run inference on Svarah and compute WER.
+
+    Svarah uses a torchcodec-style audio decoder in the 'audio_filepath' column.
+    Access pattern: sample["audio_filepath"].get_all_samples() -> frames
+    """
 
     wer_metric = evaluate.load("wer")
     all_predictions = []
@@ -244,27 +254,64 @@ def evaluate_model_on_svarah(model, dataset, text_key, feature_extractor, tokeni
     total_inference_time = 0.0
     errors = 0
 
-    # Print first few samples to debug text content
-    print(f"  Sample texts from dataset (first 3):")
-    for idx in range(min(3, len(dataset))):
-        sample_text = dataset[idx].get(text_key, "N/A")
-        print(f"    [{idx}] '{str(sample_text)[:100]}'")
-    print()
+    SAMPLE_RATE = 16000
 
     for i in tqdm(range(len(dataset)), desc="  Transcribing"):
         sample = dataset[i]
 
+        # ── Load audio ──────────────────────────────────────────────────
         try:
-            audio = sample["audio"]["array"].astype(np.float32)
-            sr = sample["audio"]["sampling_rate"]
-        except (KeyError, TypeError) as e:
+            audio_obj = sample.get("audio_filepath") or sample.get("audio")
+
+            if audio_obj is None:
+                errors += 1
+                continue
+
+            if hasattr(audio_obj, 'get_all_samples'):
+                # torchcodec decoder format (Svarah streaming)
+                frames = audio_obj.get_all_samples()
+                audio = frames.data.squeeze(0).numpy().astype(np.float32)
+                sr = frames.sample_rate
+            elif isinstance(audio_obj, dict) and "array" in audio_obj:
+                # Standard HuggingFace Audio format
+                audio = np.array(audio_obj["array"], dtype=np.float32)
+                sr = audio_obj["sampling_rate"]
+            elif isinstance(audio_obj, dict) and "path" in audio_obj:
+                # HF format with path
+                import soundfile as sf
+                audio, sr = sf.read(audio_obj["path"])
+                audio = audio.astype(np.float32)
+            elif isinstance(audio_obj, str):
+                # Raw file path
+                import soundfile as sf
+                audio, sr = sf.read(audio_obj)
+                audio = audio.astype(np.float32)
+            else:
+                errors += 1
+                if errors <= 3:
+                    print(f"  Warning [{i}]: Unknown audio format: {type(audio_obj)}")
+                continue
+
+            # Resample if needed
+            if sr != SAMPLE_RATE:
+                try:
+                    import torchaudio
+                    audio_tensor = torch.tensor(audio).unsqueeze(0)
+                    audio = torchaudio.functional.resample(audio_tensor, sr, SAMPLE_RATE).squeeze().numpy()
+                except ImportError:
+                    import librosa
+                    audio = librosa.resample(audio, orig_sr=sr, target_sr=SAMPLE_RATE)
+
+        except Exception as e:
             errors += 1
+            if errors <= 5:
+                print(f"  Warning [{i}]: Audio load error: {e}")
             continue
 
         # Track audio duration
-        total_audio_duration += len(audio) / sr
+        total_audio_duration += len(audio) / SAMPLE_RATE
 
-        # Get reference text
+        # ── Get reference text ──────────────────────────────────────────
         ref_text = sample.get(text_key, "")
         if not ref_text or not str(ref_text).strip():
             errors += 1
@@ -272,12 +319,10 @@ def evaluate_model_on_svarah(model, dataset, text_key, feature_extractor, tokeni
 
         ref_text = str(ref_text).strip()
 
-        # Normalize - use simple normalizer for multilingual data
         if use_simple_norm:
             norm_ref = simple_normalize(ref_text)
         else:
             norm_ref = normalizer(ref_text)
-            # Fallback: if English normalizer strips everything, use simple
             if not norm_ref.strip():
                 norm_ref = simple_normalize(ref_text)
 
@@ -285,9 +330,9 @@ def evaluate_model_on_svarah(model, dataset, text_key, feature_extractor, tokeni
             errors += 1
             continue
 
-        # Transcribe
+        # ── Transcribe ──────────────────────────────────────────────────
         try:
-            inputs = feature_extractor(audio, sampling_rate=16000, return_tensors="pt")
+            inputs = feature_extractor(audio, sampling_rate=SAMPLE_RATE, return_tensors="pt")
             input_values = inputs["input_values"].to(device)
 
             start_time = time.time()
@@ -311,7 +356,7 @@ def evaluate_model_on_svarah(model, dataset, text_key, feature_extractor, tokeni
         except Exception as e:
             errors += 1
             if errors <= 5:
-                print(f"  Warning: Error on sample {i}: {e}")
+                print(f"  Warning [{i}]: Inference error: {e}")
             continue
 
     if not all_references:
