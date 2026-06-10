@@ -12,6 +12,8 @@ import argparse
 import os
 import sys
 import json
+import re
+import string
 import time
 from datetime import datetime
 
@@ -29,6 +31,16 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 # ── Config ────────────────────────────────────────────────────────────────────
 SAMPLE_RATE = 16000
 TOKEN_LIMIT_FACTOR = 6.5 / SAMPLE_RATE
+
+
+def normalize_text(text):
+    """Normalize text for fair WER comparison: lowercase, remove punctuation, collapse spaces."""
+    if not text or (isinstance(text, float) and np.isnan(text)):
+        return ""
+    text = str(text).lower()
+    text = text.translate(str.maketrans('', '', string.punctuation))
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
 
 
 class LinearLowRank(nn.Module):
@@ -186,20 +198,40 @@ def evaluate_model_on_svarah(model, samples, text_key, processor, device, torch_
             continue
 
     if not all_references:
-        return {"wer": None, "samples": 0, "errors": errors}
+        return {"wer": None, "wer_normalized": None, "samples": 0, "errors": errors}
 
+    # Raw WER (no normalization)
     wer = wer_metric.compute(references=all_references, predictions=all_predictions)
     wer_pct = round(100 * wer, 2)
+
+    # Normalized WER (lowercase, no punctuation)
+    norm_refs = [normalize_text(r) for r in all_references]
+    norm_preds = [normalize_text(p) for p in all_predictions]
+    # Remove pairs where normalized ref is empty
+    valid_pairs = [(r, p) for r, p in zip(norm_refs, norm_preds) if r.strip()]
+    if valid_pairs:
+        norm_refs_clean, norm_preds_clean = zip(*valid_pairs)
+        wer_norm = wer_metric.compute(references=list(norm_refs_clean), predictions=list(norm_preds_clean))
+        wer_norm_pct = round(100 * wer_norm, 2)
+    else:
+        wer_norm_pct = None
+
     rtfx = round(total_audio_duration / total_inference_time, 2) if total_inference_time > 0 else None
 
-    # Save per-sample predictions
+    # Save per-sample predictions (with normalized versions)
     if output_path and all_results_per_sample:
+        # Add normalized text to each sample
+        for item, nr, np_ in zip(all_results_per_sample, norm_refs, norm_preds):
+            item["reference_normalized"] = nr
+            item["prediction_normalized"] = np_
+
         with open(output_path, "w", encoding="utf-8") as f:
             json.dump(all_results_per_sample, f, indent=2, ensure_ascii=False)
         print(f"  Predictions saved to: {output_path}")
 
     return {
         "wer": wer_pct,
+        "wer_normalized": wer_norm_pct,
         "samples": len(all_references),
         "errors": errors,
         "audio_hours": round(total_audio_duration / 3600, 3),
@@ -300,7 +332,8 @@ def main(args):
         }
 
         if result["wer"] is not None:
-            print(f"\n  WER: {result['wer']}%")
+            print(f"\n  Raw WER:        {result['wer']}%")
+            print(f"  Normalized WER: {result['wer_normalized']}%")
             print(f"  Samples: {result['samples']} (errors: {result['errors']})")
             if result["rtfx"]:
                 print(f"  RTFx: {result['rtfx']}x ({result['audio_hours']}h audio in {result['inference_time_s']}s)")
@@ -312,16 +345,17 @@ def main(args):
             torch.cuda.empty_cache()
 
     # Summary table
-    print(f"\n\n{'='*70}")
+    print(f"\n\n{'='*80}")
     print("SVARAH EVALUATION SUMMARY")
-    print(f"{'='*70}")
-    print(f"  {'Model':<50s} {'Enc Params':<12s} {'WER':<8s} {'RTFx':<8s}")
-    print(f"  {'-'*50} {'-'*12} {'-'*8} {'-'*8}")
+    print(f"{'='*80}")
+    print(f"  {'Model':<45s} {'Enc Params':<12s} {'Raw WER':<10s} {'Norm WER':<10s} {'RTFx':<8s}")
+    print(f"  {'-'*45} {'-'*12} {'-'*10} {'-'*10} {'-'*8}")
     for name, r in all_results.items():
-        wer_str = f"{r['wer']:.2f}%" if r.get('wer') else "N/A"
+        wer_str = f"{r['wer']:.2f}%" if r.get('wer') is not None else "N/A"
+        wer_norm_str = f"{r['wer_normalized']:.2f}%" if r.get('wer_normalized') is not None else "N/A"
         rtfx_str = f"{r['rtfx']:.1f}x" if r.get('rtfx') else "N/A"
-        print(f"  {name:<50s} {r['encoder_params']:>10,}  {wer_str:<8s} {rtfx_str:<8s}")
-    print(f"{'='*70}")
+        print(f"  {name:<45s} {r['encoder_params']:>10,}  {wer_str:<10s} {wer_norm_str:<10s} {rtfx_str:<8s}")
+    print(f"{'='*80}")
 
     # Save results
     output_path = args.output or "eval_svarah_results.json"
