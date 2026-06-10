@@ -43,6 +43,7 @@ import argparse
 import os
 import sys
 import json
+import re
 import time
 from datetime import datetime
 
@@ -217,7 +218,23 @@ def load_svarah(args):
     return ds, text_key
 
 
-def evaluate_model_on_svarah(model, dataset, text_key, feature_extractor, tokenizer, normalizer, device):
+def simple_normalize(text):
+    """Simple text normalization that works for any language.
+
+    Unlike EnglishTextNormalizer which strips non-ASCII (killing Hindi/Indian text),
+    this just lowercases, removes extra whitespace, and strips basic punctuation.
+    """
+    if not text:
+        return ""
+    text = str(text).lower().strip()
+    # Remove common punctuation but keep letters (including non-ASCII/Devanagari)
+    text = re.sub(r'[^\w\s]', '', text)
+    # Collapse whitespace
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
+
+
+def evaluate_model_on_svarah(model, dataset, text_key, feature_extractor, tokenizer, normalizer, device, use_simple_norm=False):
     """Run inference on Svarah and compute WER."""
 
     wer_metric = evaluate.load("wer")
@@ -226,6 +243,13 @@ def evaluate_model_on_svarah(model, dataset, text_key, feature_extractor, tokeni
     total_audio_duration = 0.0
     total_inference_time = 0.0
     errors = 0
+
+    # Print first few samples to debug text content
+    print(f"  Sample texts from dataset (first 3):")
+    for idx in range(min(3, len(dataset))):
+        sample_text = dataset[idx].get(text_key, "N/A")
+        print(f"    [{idx}] '{str(sample_text)[:100]}'")
+    print()
 
     for i in tqdm(range(len(dataset)), desc="  Transcribing"):
         sample = dataset[i]
@@ -246,8 +270,17 @@ def evaluate_model_on_svarah(model, dataset, text_key, feature_extractor, tokeni
             errors += 1
             continue
 
-        ref_text = str(ref_text)
-        norm_ref = normalizer(ref_text)
+        ref_text = str(ref_text).strip()
+
+        # Normalize - use simple normalizer for multilingual data
+        if use_simple_norm:
+            norm_ref = simple_normalize(ref_text)
+        else:
+            norm_ref = normalizer(ref_text)
+            # Fallback: if English normalizer strips everything, use simple
+            if not norm_ref.strip():
+                norm_ref = simple_normalize(ref_text)
+
         if not norm_ref.strip():
             errors += 1
             continue
@@ -264,7 +297,13 @@ def evaluate_model_on_svarah(model, dataset, text_key, feature_extractor, tokeni
             total_inference_time += inference_time
 
             pred_text = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
-            norm_pred = normalizer(pred_text)
+
+            if use_simple_norm:
+                norm_pred = simple_normalize(pred_text)
+            else:
+                norm_pred = normalizer(pred_text)
+                if not norm_pred.strip():
+                    norm_pred = simple_normalize(pred_text)
 
             all_predictions.append(norm_pred)
             all_references.append(norm_ref)
@@ -341,7 +380,8 @@ def main(args):
         # Evaluate
         print(f"\n  Evaluating on Svarah ({len(dataset)} samples)...")
         result = evaluate_model_on_svarah(
-            model, dataset, text_key, feature_extractor, tokenizer, normalizer, device
+            model, dataset, text_key, feature_extractor, tokenizer, normalizer, device,
+            use_simple_norm=True,  # Svarah has multilingual text, English normalizer kills it
         )
 
         all_results[model_name] = {
