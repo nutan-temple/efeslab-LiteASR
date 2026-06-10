@@ -76,7 +76,7 @@ class LinearLowRank(nn.Module):
         return (x @ self.weight1) @ self.weight2 + self.bias
 
 
-def load_compressed_model(compressed_weights_path, model_name, device):
+def load_compressed_model(compressed_weights_path, model_name, device, torch_dtype):
     """Load model with compressed encoder from .pth + original decoder from HuggingFace."""
     print(f"  Loading original model from: {model_name}")
     model = MoonshineForConditionalGeneration.from_pretrained(
@@ -132,18 +132,18 @@ def load_compressed_model(compressed_weights_path, model_name, device):
 
     # Load remaining encoder weights
     model.model.load_state_dict(encoder_sd, strict=False)
-    model = model.to(device)
+    model = model.to(device).to(torch_dtype)
     model.eval()
     return model
 
 
-def load_baseline_model(model_name, device):
+def load_baseline_model(model_name, device, torch_dtype):
     """Load the original uncompressed model."""
     print(f"  Loading baseline model from: {model_name}")
     model = MoonshineForConditionalGeneration.from_pretrained(
         model_name, trust_remote_code=True
     )
-    model = model.to(device)
+    model = model.to(device).to(torch_dtype)
     model.eval()
     return model
 
@@ -382,9 +382,12 @@ def main(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}\n")
 
-    # Load tokenizer and feature extractor
-    tokenizer = AutoTokenizer.from_pretrained(args.model)
-    feature_extractor = AutoFeatureExtractor.from_pretrained(args.model)
+    # Load processor (AutoProcessor includes both tokenizer + feature extractor)
+    from transformers import AutoProcessor
+    processor = AutoProcessor.from_pretrained(args.model)
+
+    # Determine dtype (match reference script)
+    torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
 
     # Determine models to evaluate
     models_to_eval = []
@@ -413,9 +416,9 @@ def main(args):
         print(f"{'='*60}")
 
         if weights_path is None:
-            model = load_baseline_model(args.model, device)
+            model = load_baseline_model(args.model, device, torch_dtype)
         else:
-            model = load_compressed_model(weights_path, args.model, device)
+            model = load_compressed_model(weights_path, args.model, device, torch_dtype)
 
         # Print param counts
         encoder_params = sum(p.numel() for p in model.model.encoder.parameters())
@@ -430,7 +433,7 @@ def main(args):
 
         print(f"\n  Evaluating on Svarah ({len(dataset)} samples)...")
         result = evaluate_model_on_svarah(
-            model, dataset, text_key, feature_extractor, tokenizer, device,
+            model, dataset, text_key, processor, device, torch_dtype,
             output_predictions_path=predictions_path,
         )
 
