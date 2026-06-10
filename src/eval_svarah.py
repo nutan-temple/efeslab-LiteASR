@@ -240,16 +240,19 @@ def simple_normalize(text):
     return text
 
 
-def evaluate_model_on_svarah(model, dataset, text_key, feature_extractor, tokenizer, normalizer, device, use_simple_norm=False):
+def evaluate_model_on_svarah(model, dataset, text_key, feature_extractor, tokenizer, device, output_predictions_path=None):
     """Run inference on Svarah and compute WER.
 
-    Svarah uses a torchcodec-style audio decoder in the 'audio_filepath' column.
-    Access pattern: sample["audio_filepath"].get_all_samples() -> frames
+    Uses NO normalization (matching the reference script that got 16% WER).
+    Raw reference text vs raw prediction, just stripped of leading/trailing whitespace.
+
+    Also saves per-sample predictions to a JSON file for analysis.
     """
 
     wer_metric = evaluate.load("wer")
     all_predictions = []
     all_references = []
+    all_results_per_sample = []  # for saving to file
     total_audio_duration = 0.0
     total_inference_time = 0.0
     errors = 0
@@ -277,12 +280,10 @@ def evaluate_model_on_svarah(model, dataset, text_key, feature_extractor, tokeni
                 audio = np.array(audio_obj["array"], dtype=np.float32)
                 sr = audio_obj["sampling_rate"]
             elif isinstance(audio_obj, dict) and "path" in audio_obj:
-                # HF format with path
                 import soundfile as sf
                 audio, sr = sf.read(audio_obj["path"])
                 audio = audio.astype(np.float32)
             elif isinstance(audio_obj, str):
-                # Raw file path
                 import soundfile as sf
                 audio, sr = sf.read(audio_obj)
                 audio = audio.astype(np.float32)
@@ -311,24 +312,13 @@ def evaluate_model_on_svarah(model, dataset, text_key, feature_extractor, tokeni
         # Track audio duration
         total_audio_duration += len(audio) / SAMPLE_RATE
 
-        # ── Get reference text ──────────────────────────────────────────
+        # ── Get reference text (NO normalization - match reference script) ──
         ref_text = sample.get(text_key, "")
         if not ref_text or not str(ref_text).strip():
             errors += 1
             continue
 
         ref_text = str(ref_text).strip()
-
-        if use_simple_norm:
-            norm_ref = simple_normalize(ref_text)
-        else:
-            norm_ref = normalizer(ref_text)
-            if not norm_ref.strip():
-                norm_ref = simple_normalize(ref_text)
-
-        if not norm_ref.strip():
-            errors += 1
-            continue
 
         # ── Transcribe ──────────────────────────────────────────────────
         try:
@@ -341,17 +331,22 @@ def evaluate_model_on_svarah(model, dataset, text_key, feature_extractor, tokeni
             inference_time = time.time() - start_time
             total_inference_time += inference_time
 
-            pred_text = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
+            pred_text = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0].strip()
 
-            if use_simple_norm:
-                norm_pred = simple_normalize(pred_text)
-            else:
-                norm_pred = normalizer(pred_text)
-                if not norm_pred.strip():
-                    norm_pred = simple_normalize(pred_text)
+            all_predictions.append(pred_text)
+            all_references.append(ref_text)
 
-            all_predictions.append(norm_pred)
-            all_references.append(norm_ref)
+            # Save per-sample result
+            audio_id = sample.get("audio_filepath", f"sample_{i}")
+            if hasattr(audio_id, 'get_all_samples'):
+                audio_id = f"sample_{i}"
+            all_results_per_sample.append({
+                "id": str(audio_id) if isinstance(audio_id, str) else f"sample_{i}",
+                "reference": ref_text,
+                "prediction": pred_text,
+                "duration": round(len(audio) / SAMPLE_RATE, 2),
+                "inference_time": round(inference_time, 3),
+            })
 
         except Exception as e:
             errors += 1
@@ -360,11 +355,17 @@ def evaluate_model_on_svarah(model, dataset, text_key, feature_extractor, tokeni
             continue
 
     if not all_references:
-        return {"wer": None, "samples": 0, "errors": errors}
+        return {"wer": None, "samples": 0, "errors": errors, "per_sample": []}
 
     wer = wer_metric.compute(references=all_references, predictions=all_predictions)
     wer_pct = round(100 * wer, 2)
     rtfx = round(total_audio_duration / total_inference_time, 2) if total_inference_time > 0 else None
+
+    # Save per-sample predictions to file
+    if output_predictions_path:
+        with open(output_predictions_path, "w", encoding="utf-8") as f:
+            json.dump(all_results_per_sample, f, indent=2, ensure_ascii=False)
+        print(f"  Predictions saved to: {output_predictions_path}")
 
     return {
         "wer": wer_pct,
@@ -373,6 +374,7 @@ def evaluate_model_on_svarah(model, dataset, text_key, feature_extractor, tokeni
         "audio_hours": round(total_audio_duration / 3600, 3),
         "inference_time_s": round(total_inference_time, 1),
         "rtfx": rtfx,
+        "per_sample": all_results_per_sample,
     }
 
 
@@ -383,7 +385,6 @@ def main(args):
     # Load tokenizer and feature extractor
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     feature_extractor = AutoFeatureExtractor.from_pretrained(args.model)
-    normalizer = EnglishTextNormalizer()
 
     # Determine models to evaluate
     models_to_eval = []
@@ -423,10 +424,14 @@ def main(args):
         print(f"  Encoder: {encoder_params:,} | Decoder: {decoder_params:,} | Total: {total_params:,}")
 
         # Evaluate
+        # Generate output predictions filename for this model
+        safe_model_name = model_name.replace("/", "_").replace(":", "_").replace(" ", "_")
+        predictions_path = f"predictions_svarah_{safe_model_name}.json"
+
         print(f"\n  Evaluating on Svarah ({len(dataset)} samples)...")
         result = evaluate_model_on_svarah(
-            model, dataset, text_key, feature_extractor, tokenizer, normalizer, device,
-            use_simple_norm=True,  # Svarah has multilingual text, English normalizer kills it
+            model, dataset, text_key, feature_extractor, tokenizer, device,
+            output_predictions_path=predictions_path,
         )
 
         all_results[model_name] = {
