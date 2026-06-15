@@ -1,200 +1,158 @@
-# SpQR W8A8 Quantization for Moonshine
+# Encoder-only SpQR Quantization for Moonshine
 
-A standalone W8A8 (8-bit weights, 8-bit activations) quantization pipeline
-for LiteASR-compressed Moonshine ASR models, using GPTQ-style Hessian-aware
-calibration.
+A quantization pipeline that applies the **real [SpQR](https://arxiv.org/abs/2306.03078)
+algorithm** (Sparse-Quantized Representation) to the **encoder** of a
+LiteASR-compressed Moonshine ASR model.
 
-## What This Does
+This is **not** a naive round-to-int8 scheme. The quantization engine is used
+**verbatim** from the upstream [SpQR repository](https://github.com/Vahe1994/SpQR):
 
-This pipeline takes a LiteASR `.pth` file (a Moonshine model where encoder
-layers have been compressed using low-rank factorization) and applies INT8
-quantization to all linear layers using GPTQ calibration for optimal rounding.
+| File | Role |
+|------|------|
+| `spqr_engine.py` | `SPQRUtil` — GPTQ Hessian-aware error propagation + unstructured outlier detection |
+| `quant_groups.py` | `Quantizer` — per-group scale/zero estimation and meta-quantization |
+| `weight_permutation.py` | `get_permutation_order` — `act_order` / `spearman` column reordering |
 
-### What W8A8 Means
+These three files are copied **byte-for-byte** and are **not modified**.
+`SPQRUtil.quantize()` performs, in order:
 
-- **W8 (Weight 8-bit):** All weight matrices are quantized to INT8 using
-  per-channel symmetric quantization. Each output channel (row) gets its own
-  scale factor: `scale = max(|row|) / 127`
+1. **Column permutation** (`act_order`) — quantize the most salient input
+   features first, ordered by the Hessian diagonal.
+2. **GPTQ error propagation** — each column is quantized and its rounding error
+   is pushed onto the remaining columns, weighted by the inverse-Hessian
+   Cholesky factor.
+3. **Unstructured outlier detection** — individual weights whose quantization
+   error exceeds a relative threshold are kept in **fp16** (a leave-one-out
+   re-fit decides which weights are outliers); the rest are re-quantized
+   without them.
+4. **Meta-quantization** — the per-group scales and zero-points are themselves
+   quantized (`qq_scale_bits` / `qq_zero_bits`).
 
-- **A8 (Activation 8-bit):** At inference time, activations are dynamically
-  quantized to INT8 using per-tensor symmetric quantization. This happens
-  on-the-fly based on the observed activation range.
+## Why encoder-only
 
-### Why GPTQ Calibration
+LiteASR and follow-up work show the Moonshine/Whisper **encoder** is the
+runtime bottleneck (compute-bound, long sequences), while the decoder can be
+compressed by other means. This pipeline therefore quantizes **only**
+`model.model.encoder.layers` and leaves the decoder in full precision. The
+compression report reflects this honestly (see below) — there is **no** flat
+"4× total" claim.
 
-Naive INT8 quantization (round to nearest) ignores the input distribution.
-GPTQ uses a Hessian-based approach:
+## Pipeline
 
-1. Collect `H = X^T X / n` from calibration data (LibriSpeech dev-clean)
-2. Process weight columns sequentially using the inverse Hessian
-3. Propagate quantization error from each column to subsequent columns
-4. This compensates for rounding errors in a data-aware manner
+1. Load `usefulsensors/moonshine-base` via `MoonshineForConditionalGeneration`.
+2. *(optional)* Load a LiteASR `.pth` and swap encoder sublayers for
+   `LinearLowRank` wherever `weight1`/`weight2` keys exist.
+3. Quantize each encoder layer's sublayers in **GPTQ-sequential groups** so
+   later projections are calibrated against the **already-quantized**
+   activations of earlier ones:
 
-The result is significantly better accuracy than naive rounding, especially
-for sensitive layers.
+   ```
+   [q_proj, k_proj, v_proj]  ->  [o_proj]  ->  [mlp.fc1]  ->  [mlp.fc2]
+   ```
 
-## Architecture
+   * **`nn.Linear`** sublayers are quantized directly with `SPQRUtil`.
+   * **`LinearLowRank`** sublayers have **both** low-rank factors quantized
+     independently, each with its own Hessian: `W1`'s input is the layer input
+     `x`, and `W2`'s input is `x @ W1`. The low-rank structure is preserved
+     (the factors are quantized in place — not collapsed into a dense matrix).
+4. Evaluate WER on LibriSpeech `test-clean` + `test-other`.
+5. Report encoder-only compression.
 
-The Moonshine model (`usefulsensors/moonshine-base`) has:
-- **Encoder:** Conv frontend + 8 transformer layers with RoPE
-  - Conv1(1, 416, k=127, s=64) -> tanh -> GroupNorm -> Conv2(416, 832, k=7, s=3) -> GELU -> Conv3(832, 416, k=3, s=2) -> GELU
-  - 8 layers: self-attention (q/k/v/o_proj) + MLP (fc1, fc2)
-- **Decoder:** 8 transformer layers with self-attention + cross-attention + SwiGLU MLP
-  - hidden_size=416, intermediate_size=1664, 8 heads, vocab=32768
+### Calibration
 
-### LiteASR Compression
+Real speech from LibriSpeech `validation-clean` is run through the encoder conv
+frontend to produce transformer-layer inputs; per-layer forward passes then
+accumulate the Hessians used by SpQR. Variable-length clips are processed
+individually (no zero-padding) to avoid polluting the Hessian.
 
-The `.pth` file contains encoder layers where some `nn.Linear` modules have
-been replaced with `LinearLowRank`:
+## Correct WER evaluation
 
-```python
-class LinearLowRank(nn.Module):
-    def __init__(self, weight1, weight2, bias):
-        super().__init__()
-        self.weight1 = nn.Parameter(weight1)  # (in_features, rank)
-        self.weight2 = nn.Parameter(weight2)  # (rank, out_features)
-        self.bias = nn.Parameter(bias)
+The evaluation in `eval_utils.py` **replicates the reference Moonshine recipe
+exactly**, which is what makes the numbers comparable to the published baseline
+of **3.38% test-clean / 9.38% test-other**:
 
-    def forward(self, x):
-        return (x @ self.weight1) @ self.weight2 + self.bias
-```
+* the model runs in **float16 on GPU** (float32 on CPU);
+* inputs are moved *and cast* with `inputs.to(device, torch_dtype)`;
+* generation is **token-limited**: `max_length = max(int(seq_lens * 6.5/16000), 10)`;
+* hypotheses **and** references are normalized identically — lowercased,
+  stripped, and **punctuation-removed** — before WER is computed.
 
-The W8A8 quantization handles both `nn.Linear` and `LinearLowRank` layers.
+> The last point matters: Moonshine emits cased, punctuated text while
+> LibriSpeech references are upper-cased and unpunctuated. Without identical
+> normalization the WER is massively inflated. (An earlier version that only
+> lowercased — keeping punctuation — and ran in fp32 produced spuriously high
+> WER.)
 
-## File Structure
+## Compression accounting
 
-```
-quantize_w8a8.py   - Main entry point
-modelutils.py      - Model loading (HF + LiteASR .pth) and layer utilities
-quant_engine.py    - W8A8 quantization engine (GPTQ + INT8 primitives)
-datautils.py       - Calibration data (LibriSpeech dev) and eval data loading
-eval_utils.py      - WER evaluation on LibriSpeech test-clean/test-other
-requirements.txt   - Python dependencies
-README.md          - This file
-```
+Because **only the encoder is quantized**, the script reports separate, honest
+figures instead of a single headline ratio:
+
+* the **encoder** shrinks ~3–4× — its effective bits/weight are
+  `wbits + (qq_scale_bits + qq_zero_bits)/groupsize + outlier_fraction·32`
+  (the conv/norm/bias tensors stay fp32);
+* the **whole model** shrinks only in proportion to the encoder's share of the
+  parameters, since the fp32 decoder dominates the remaining size.
 
 ## Usage
 
-### Basic W8A8 Quantization
-
 ```bash
-python quantize_w8a8.py \
-    --pth_path /path/to/lite-moonshine-moonshine-base_0.98:0.99.pth \
-    --nsamples 128 \
-    --max_eval_samples 200
+# 8-bit encoder-only SpQR with outlier detection, full LibriSpeech eval
+python quantize_encoder_spqr.py \
+    --pth_path lite-moonshine-moonshine-base_0.99:0.999.pth \
+    --wbits 8 --groupsize 16 --perchannel \
+    --qq_scale_bits 3 --qq_zero_bits 3 \
+    --outlier_threshold 0.2 --permutation_order act_order \
+    --nsamples 128
+
+# Dense base encoder (no .pth), quick check on a few eval samples
+python quantize_encoder_spqr.py --wbits 8 --max_eval_samples 50
+
+# CPU smoke test: one layer, no eval
+python quantize_encoder_spqr.py --nsamples 2 --skip_eval --max_layers 1
 ```
 
-### Full Evaluation
-
-```bash
-python quantize_w8a8.py \
-    --pth_path /path/to/model.pth \
-    --nsamples 128 \
-    --save quantized_w8a8.pth \
-    --output results.json
-```
-
-### Encoder-Only Quantization
-
-```bash
-python quantize_w8a8.py \
-    --pth_path /path/to/model.pth \
-    --part encoder \
-    --nsamples 64
-```
-
-### Quick Test (No Network Required)
-
-```bash
-python quantize_w8a8.py \
-    --pth_path /path/to/model.pth \
-    --use_synthetic \
-    --nsamples 16 \
-    --skip_eval
-```
-
-## Arguments
+### Key arguments
 
 | Argument | Default | Description |
 |----------|---------|-------------|
-| `--pth_path` | (required) | Path to LiteASR .pth checkpoint |
-| `--model` | `usefulsensors/moonshine-base` | HuggingFace model name |
-| `--part` | `both` | Which parts to quantize: encoder, decoder, or both |
-| `--blocksize` | `128` | GPTQ block size for column processing |
-| `--percdamp` | `0.01` | GPTQ Hessian damping factor |
-| `--nsamples` | `128` | Number of calibration samples |
-| `--audio_len` | `160000` | Audio length (samples at 16kHz, 160000 = 10s) |
-| `--use_synthetic` | False | Use random noise instead of LibriSpeech |
-| `--skip_eval` | False | Skip WER evaluation |
-| `--max_eval_samples` | None | Max eval samples per split (None = all) |
-| `--save` | None | Path to save quantized state_dict |
-| `--output` | `w8a8_results.json` | Path to save results JSON |
+| `--pth_path` | None | Optional LiteASR `.pth` (encoder `LinearLowRank`). Omit to quantize the dense base encoder. |
+| `--wbits` | `8` | Base weight bits for SpQR. |
+| `--groupsize` | `16` | Input-feature group size for scale/zero estimation. |
+| `--perchannel` / `--no_perchannel` | on | Per-output-channel base quantization. |
+| `--qq_scale_bits` / `--qq_zero_bits` | `3` / `3` | Meta-quantization bits for scales/zeros. |
+| `--outlier_threshold` | `0.2` | `outlier_relative_threshold`; use `inf` to disable outliers. |
+| `--permutation_order` | `act_order` | `identity`, `act_order`, or `spearman`. |
+| `--nsamples` | `128` | Calibration clips from LibriSpeech `validation-clean`. |
+| `--max_eval_samples` | None | Cap eval samples per split (None = full: 2620 clean / 2939 other). |
+| `--max_layers` | None | Quantize only the first N encoder layers (smoke testing). |
+| `--skip_eval` | False | Skip WER evaluation. |
+| `--save` / `--output` | None | Save the quantized state dict / results JSON. |
 
-## How Each File Works
+## File structure
 
-### `quantize_w8a8.py` (Main Entry Point)
-
-Orchestrates the full pipeline:
-1. Parses command-line arguments
-2. Loads the Moonshine model and applies LiteASR .pth weights
-3. Optionally evaluates WER before quantization
-4. Loads calibration data (LibriSpeech dev or synthetic)
-5. Runs W8A8 quantization on encoder and/or decoder
-6. Optionally evaluates WER after quantization
-7. Prints a comparison table and saves results
-
-### `modelutils.py` (Model Utilities)
-
-Handles all model-related operations:
-- `load_moonshine_model()`: Downloads Moonshine from HuggingFace
-- `load_liteasr_pth()`: Replaces encoder Linear layers with LinearLowRank
-- `get_encoder_layers()` / `get_decoder_layers()`: Access layer lists
-- `find_sublayers()`: Find all Linear/LinearLowRank in a layer
-- `get_encoder_sequential_groups()`: Groups of sublayers that share inputs
-- `get_decoder_sequential_groups()`: Same for decoder (includes cross-attention)
-
-### `quant_engine.py` (Quantization Engine)
-
-Core quantization logic:
-- `quantize_weight_int8_perchannel()`: Per-channel symmetric INT8 quantization
-- `dequantize_weight_int8()`: Reverse (for simulation/evaluation)
-- `quantize_activation_int8_dynamic()`: Dynamic per-tensor INT8 for activations
-- `GPTQQuantizer`: Hessian-aware quantization class
-  - `add_batch()`: Accumulates H = X^T X / n from calibration inputs
-  - `quantize()`: Runs GPTQ algorithm targeting INT8
-- `quantize_encoder_w8a8()`: Quantizes all encoder layers
-- `quantize_decoder_w8a8()`: Quantizes all decoder layers
-- `W8A8Linear` / `W8A8LinearLowRank`: Quantized layer wrappers
-
-### `datautils.py` (Data Utilities)
-
-Data loading for calibration and evaluation:
-- `get_librispeech_calibration()`: Loads LibriSpeech dev-clean for GPTQ calibration
-- `get_librispeech_eval()`: Loads LibriSpeech test splits for WER evaluation
-- `get_synthetic_calibration()`: Random noise for testing without network
-
-### `eval_utils.py` (Evaluation)
-
-WER evaluation using the HuggingFace `evaluate` library:
-- `evaluate_wer()`: Runs model.generate() on a dataset, computes WER
-- `evaluate_model()`: Full evaluation on test-clean and test-other
-- Uses `max_length = max(int(seq_lens * 6.5/16000), 10)` for generation
-
-## Expected Results
-
-With 128 calibration samples on a typical LiteASR model:
-- Compression: ~4x (FP32 to INT8)
-- WER degradation: typically < 1% absolute on test-clean
-- Quantization time: ~2-5 minutes on A100 (depends on model size)
+```
+quantize_encoder_spqr.py  - Main entry point (encoder-only SpQR)
+spqr_engine.py            - VERBATIM upstream SpQR: SPQRUtil (GPTQ + outliers)
+quant_groups.py           - VERBATIM upstream SpQR: Quantizer
+weight_permutation.py     - VERBATIM upstream SpQR: get_permutation_order
+modelutils.py             - Moonshine + LiteASR .pth loading, layer utilities
+datautils.py              - Calibration / eval data loading
+eval_utils.py             - Correct WER evaluation (reference recipe)
+requirements.txt          - Python dependencies
+```
 
 ## Requirements
 
-- Python >= 3.9
-- PyTorch >= 2.0
-- transformers >= 4.49.0 (for Moonshine support)
-- CUDA recommended (works on CPU but slower)
-
-Install dependencies:
 ```bash
 pip install -r requirements.txt
 ```
+
+- Python >= 3.9, PyTorch >= 2.0, transformers >= 4.49.0 (for Moonshine support)
+- CUDA recommended (and required to reproduce the fp16 baseline numbers).
+
+## Acknowledgements
+
+- [SpQR: Sparse-Quantized Representation](https://github.com/Vahe1994/SpQR) — the quantization engine used verbatim.
+- [LiteASR](https://arxiv.org/abs/2502.20583) — low-rank encoder compression.
+- [Moonshine](https://huggingface.co/usefulsensors/moonshine-base) — the ASR model.
