@@ -41,6 +41,13 @@ Examples
     # Dense base encoder (no .pth), quick check on a few eval samples:
     python quantize_encoder_spqr.py --wbits 8 --max_eval_samples 50
 
+    # True dynamic W8A8: SpQR int8 weights + dynamic int8 activations:
+    python quantize_encoder_spqr.py \
+        --pth_path lite-moonshine-moonshine-base_0.99:0.999.pth \
+        --wbits 8 --groupsize 16 --perchannel \
+        --quantize_activations --act_granularity per_token \
+        --nsamples 128
+
     # CPU smoke test (no eval, one layer):
     python quantize_encoder_spqr.py --nsamples 2 --skip_eval --max_layers 1
 """
@@ -340,6 +347,14 @@ def main():
     parser.add_argument("--permutation_order", type=str, default="act_order",
                         choices=["identity", "act_order", "spearman"])
     parser.add_argument("--simplified_outliers", action="store_true")
+    # dynamic activation quantization (true W8A8)
+    parser.add_argument("--quantize_activations", action="store_true",
+                        help="Enable dynamic INT8 activation quantization on top "
+                             "of the SpQR int8 weights (true W8A8). Without this "
+                             "flag the encoder is weight-only quantized (W8A16).")
+    parser.add_argument("--act_granularity", type=str, default="per_token",
+                        choices=["per_token", "per_tensor"],
+                        help="Dynamic activation scale granularity (default per_token).")
     # calibration / eval
     parser.add_argument("--nsamples", type=int, default=128)
     parser.add_argument("--audio_len", type=int, default=160000)
@@ -359,6 +374,11 @@ def main():
     print(f"SpQR: W{args.wbits} groupsize={args.groupsize} perchannel={args.perchannel} "
           f"qq=({args.qq_scale_bits},{args.qq_zero_bits}) "
           f"outlier_thr={args.outlier_threshold} perm={args.permutation_order}")
+    if args.quantize_activations:
+        print(f"Activations: dynamic INT8 ({args.act_granularity}) "
+              f"-> mode W{args.wbits}A8 (true dynamic W8A8)")
+    else:
+        print(f"Activations: fp16 (weight-only) -> mode W{args.wbits}A16")
 
     start = time.time()
 
@@ -394,12 +414,35 @@ def main():
 
     comp = report_compression(model, args, stats["outlier_fraction"], stats["quantized_params"])
 
+    # Optionally add dynamic INT8 activation quantization (true W8A8) on top of
+    # the SpQR int8 weights. This wraps each quantized encoder sublayer so that
+    # the activation entering every matmul is quantized to int8 at runtime.
+    n_wrapped = 0
+    if args.quantize_activations:
+        from act_quant import wrap_encoder_activations
+        n_wrapped = wrap_encoder_activations(
+            model, granularity=args.act_granularity, max_layers=args.max_layers)
+        print("\n" + "=" * 70)
+        print("DYNAMIC ACTIVATION QUANTIZATION (true W8A8)")
+        print("=" * 70)
+        print(f"  Wrapped {n_wrapped} encoder sublayers with ActQuantWrapper")
+        print(f"  Activation scheme : dynamic INT8, {args.act_granularity}, symmetric")
+        print(f"  Mode              : W{args.wbits}A8 (dynamic activations, "
+              f"{args.act_granularity})")
+
+    mode = (f"W{args.wbits}A8 (dynamic activations, {args.act_granularity})"
+            if args.quantize_activations else f"W{args.wbits}A16")
+
     results = {
         "timestamp": datetime.now().isoformat(),
         "model": args.model,
         "pth_path": args.pth_path,
         "method": "encoder-only SpQR (verbatim SPQRUtil: GPTQ + outlier detection)",
+        "mode": mode,
         "wbits": args.wbits,
+        "activation_quant": bool(args.quantize_activations),
+        "act_granularity": args.act_granularity if args.quantize_activations else None,
+        "activation_wrapped_sublayers": n_wrapped,
         "groupsize": args.groupsize,
         "outlier_threshold": args.outlier_threshold,
         "permutation_order": args.permutation_order,
@@ -413,7 +456,7 @@ def main():
         from eval_utils import evaluate_model
         model = model.to(device).to(torch_dtype).eval()
         print("\n" + "=" * 70)
-        print("WER EVALUATION (encoder-quantized model)")
+        print(f"WER EVALUATION ({mode} encoder-quantized model)")
         print("=" * 70)
         wer = evaluate_model(model, processor, device, torch_dtype, args.max_eval_samples)
         results["wer"] = wer

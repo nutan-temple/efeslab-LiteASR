@@ -58,6 +58,33 @@ compression report reflects this honestly (see below) — there is **no** flat
 4. Evaluate WER on LibriSpeech `test-clean` + `test-other`.
 5. Report encoder-only compression.
 
+## Weight-only (W8A16) vs. dynamic W8A8
+
+By default this pipeline is **weight-only**: the encoder weights are SpQR
+int8-quantized while activations stay fp16 — i.e. **W8A16**. The int8 weights
+are dequantized into fp16 at compute time, so the matmuls run in fp16.
+
+Passing `--quantize_activations` adds the **A8** half to produce **true dynamic
+W8A8**: on top of the SpQR int8 weights, the activation entering every encoder
+matmul is quantized to int8 **dynamically** — the scale is recomputed on each
+forward pass directly from the activation (`x.abs().amax(...) / 127`), so no
+calibration set or stored activation statistics are needed. The quantized
+activation is dequantized before the matmul, so the product simulates the
+int8 × int8 error of a real W8A8 kernel.
+
+* **`--act_granularity per_token`** (default, recommended): one symmetric scale
+  per token position, computed over the hidden dimension. This per-row
+  granularity is markedly more accurate than per-tensor.
+* **`--act_granularity per_tensor`**: a single symmetric scale for the whole
+  activation tensor.
+
+Activation quantization is implemented by `act_quant.ActQuantWrapper`, which
+wraps each already-weight-quantized encoder sublayer (`q_proj`, `k_proj`,
+`v_proj`, `o_proj`, `fc1`, `fc2`). For a `LinearLowRank` factor pair it quantizes
+the activation entering **each** of the two matmuls (`x` before `@ weight1` and
+the intermediate `x @ weight1` before `@ weight2`) so the W8A8 simulation is
+faithful end-to-end. The weight-only path is unchanged when the flag is omitted.
+
 ### Calibration
 
 Real speech from LibriSpeech `validation-clean` is run through the encoder conv
@@ -108,6 +135,13 @@ python quantize_encoder_spqr.py \
 # Dense base encoder (no .pth), quick check on a few eval samples
 python quantize_encoder_spqr.py --wbits 8 --max_eval_samples 50
 
+# True dynamic W8A8: SpQR int8 weights + dynamic int8 activations (per-token)
+python quantize_encoder_spqr.py \
+    --pth_path lite-moonshine-moonshine-base_0.99:0.999.pth \
+    --wbits 8 --groupsize 16 --perchannel \
+    --quantize_activations --act_granularity per_token \
+    --nsamples 128
+
 # CPU smoke test: one layer, no eval
 python quantize_encoder_spqr.py --nsamples 2 --skip_eval --max_layers 1
 ```
@@ -123,6 +157,8 @@ python quantize_encoder_spqr.py --nsamples 2 --skip_eval --max_layers 1
 | `--qq_scale_bits` / `--qq_zero_bits` | `3` / `3` | Meta-quantization bits for scales/zeros. |
 | `--outlier_threshold` | `0.2` | `outlier_relative_threshold`; use `inf` to disable outliers. |
 | `--permutation_order` | `act_order` | `identity`, `act_order`, or `spearman`. |
+| `--quantize_activations` | off | Add dynamic INT8 activation quantization on top of SpQR int8 weights (true **W8A8**). Off = weight-only **W8A16**. |
+| `--act_granularity` | `per_token` | Dynamic activation scale granularity: `per_token` (recommended) or `per_tensor`. |
 | `--nsamples` | `128` | Calibration clips from LibriSpeech `validation-clean`. |
 | `--max_eval_samples` | None | Cap eval samples per split (None = full: 2620 clean / 2939 other). |
 | `--max_layers` | None | Quantize only the first N encoder layers (smoke testing). |
@@ -136,6 +172,7 @@ quantize_encoder_spqr.py  - Main entry point (encoder-only SpQR)
 spqr_engine.py            - VERBATIM upstream SpQR: SPQRUtil (GPTQ + outliers)
 quant_groups.py           - VERBATIM upstream SpQR: Quantizer
 weight_permutation.py     - VERBATIM upstream SpQR: get_permutation_order
+act_quant.py              - Dynamic INT8 activation quantization (ActQuantWrapper) for W8A8
 modelutils.py             - Moonshine + LiteASR .pth loading, layer utilities
 datautils.py              - Calibration / eval data loading
 eval_utils.py             - Correct WER evaluation (reference recipe)
