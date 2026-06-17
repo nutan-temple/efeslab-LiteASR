@@ -346,17 +346,30 @@ def get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps):
 class LibriSpeechCollator:
     """Collate function for LibriSpeech that pads waveforms and tokenizes text.
 
+    Uses manual padding for tokenized labels to avoid relying on the tokenizer's
+    pad_token setting, which does not survive pickling in DataLoader worker
+    processes (the Moonshine tokenizer loses pad_token through serialization).
+
     Args:
         tokenizer: HuggingFace tokenizer for the Moonshine model.
         max_audio_len: Maximum audio length in samples (for truncation).
+        pad_token_id: Token ID to use for padding labels. Defaults to 2
+            (eos_token_id for Moonshine, which also serves as pad).
     """
 
-    def __init__(self, tokenizer, max_audio_len: Optional[int] = None):
+    def __init__(self, tokenizer, max_audio_len: Optional[int] = None,
+                 pad_token_id: int = 2):
         self.tokenizer = tokenizer
         self.max_audio_len = max_audio_len
+        self.pad_token_id = pad_token_id
 
     def __call__(self, batch):
         """Collate a batch of samples.
+
+        Tokenizes each text individually (no batch padding from tokenizer),
+        then manually pads all token sequences to the max length in the batch
+        using self.pad_token_id. This avoids the ValueError from tokenizers
+        that lack a pad_token, and is robust to pickling in worker processes.
 
         Args:
             batch: List of dataset samples, each with 'audio' and 'text' fields.
@@ -386,14 +399,24 @@ class LibriSpeechCollator:
             padded_waveforms[i, : w.shape[0]] = w
             attention_mask[i, : w.shape[0]] = 1
 
-        # Tokenize text targets
-        tokenized = self.tokenizer(
-            texts,
-            padding=True,
-            return_tensors="pt",
-            return_attention_mask=True,
+        # Tokenize text targets individually (no padding from tokenizer).
+        # This avoids the "tokenizer does not have a padding token" error
+        # that occurs when the Moonshine tokenizer is pickled/unpickled
+        # by DataLoader worker processes.
+        token_ids_list = []
+        for text in texts:
+            encoded = self.tokenizer(text, return_attention_mask=False)
+            token_ids_list.append(encoded["input_ids"])
+
+        # Manually pad all token sequences to the max length in the batch
+        max_label_len = max(len(ids) for ids in token_ids_list)
+        labels = torch.full(
+            (len(token_ids_list), max_label_len),
+            self.pad_token_id,
+            dtype=torch.long,
         )
-        labels = tokenized["input_ids"]
+        for i, ids in enumerate(token_ids_list):
+            labels[i, : len(ids)] = torch.tensor(ids, dtype=torch.long)
 
         return {
             "input_values": padded_waveforms,
@@ -449,9 +472,12 @@ def setup_model(args, device):
     logger.info(f"Loading model: {args.model_name}")
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
 
-    # Moonshine tokenizer doesn't define a pad token; use eos_token for padding
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
+    # Moonshine tokenizer doesn't define pad_token or eos_token as string
+    # properties, but the model's config uses pad_token_id=2, eos_token_id=2.
+    # Set pad_token_id explicitly on the tokenizer so it's available for any
+    # downstream usage (though the collator uses its own manual padding).
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token_id = 2
 
     quantized_model = load_pretrained_moonshine(
         model_name=args.model_name,
@@ -670,7 +696,7 @@ def train(args):
 
     # Setup loss functions
     vocab_size = raw_model.model.decoder.token_embedding.weight.shape[0]
-    pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+    pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 2
 
     ce_criterion = LabelSmoothingLoss(
         size=vocab_size,
@@ -686,7 +712,7 @@ def train(args):
 
     # Load dataset
     dataset = load_dataset_splits(args)
-    collator = LibriSpeechCollator(tokenizer=tokenizer)
+    collator = LibriSpeechCollator(tokenizer=tokenizer, pad_token_id=pad_token_id)
 
     # Use DistributedSampler for multi-GPU
     if is_distributed:
