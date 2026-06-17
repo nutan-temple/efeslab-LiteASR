@@ -1,0 +1,47 @@
+# QACT Co-Training Configuration for Moonshine ASR
+# Default settings matching the paper's hyperparameters
+#
+# Component-wise precision (weight-only quantization):
+#   - Encoder attention + MLP: enc-weight-bit (2-bit, co-trained with 1-bit)
+#   - Encoder Conv frontend: conv-weight-bit (4-bit, conv layers are sensitive)
+#   - Decoder (self-attn, cross-attn, MLP): dec-weight-bit (4-bit, fixed)
+#   - Embeddings & LayerNorms: Full precision (unquantized)
+#   - Activations: FP32/FP16 (weight-only quantization)
+
+# Model settings
+model-name: usefulsensors/moonshine-base
+
+# Quantization settings
+enc-weight-bit: 2
+dec-weight-bit: 4
+conv-weight-bit: 4
+use-scaling: true
+quant-mode: symmetric
+quant-decoder: true
+
+# QACT co-training hyperparameters
+# Note: co-training (multi-precision 2-bit/1-bit/stochastic) applies ONLY
+# to the encoder. Decoder and conv stay at fixed 4-bit throughout.
+mix-rate: 1.8
+lambda-1: 0.5
+lambda-2: 1.0
+
+# Training settings
+epochs: 100
+batch-size: 64
+lr: 0.00005
+warmup-steps: 1000
+grad-clip: 5.0
+accum-grad: 1
+label-smoothing: 0.1
+
+# Dataset settings
+dataset: librispeech_asr
+dataset-config: clean
+train-split: train.100
+num-workers: 4
+
+# Logging and saving
+log-interval: 10
+save-interval: 1
+seed: 42

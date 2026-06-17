@@ -225,8 +225,8 @@ class MultiHeadAttention(nn.Module):
         q = self.query(x)
         batch, seq_len, _ = q.shape
 
-        if kv_cache is None:
-            # Encoder self-attention: no KV cache
+        if kv_cache is None and xa is None:
+            # Encoder self-attention OR decoder self-attention without cache
             k = self.key(x)
             v = self.value(x)
 
@@ -238,6 +238,18 @@ class MultiHeadAttention(nn.Module):
             # Apply RoPE
             if self.use_rope and self.rotary_emb is not None and position_ids is not None:
                 q, k = self._apply_rope_to_qk(q, k, position_ids)
+
+            wv = self._sdpa(q, k, v, mask=mask)
+
+        elif kv_cache is None and xa is not None:
+            # Cross-attention without cache (training mode)
+            # Compute K/V directly from encoder output to preserve gradient flow
+            q = q.view(batch, seq_len, self.n_head, self.head_dim).permute(0, 2, 1, 3)
+            k = self.key(xa)
+            v = self.value(xa)
+            kv_len = xa.shape[1]
+            k = k.view(batch, kv_len, self.n_head, self.head_dim).permute(0, 2, 1, 3)
+            v = v.view(batch, kv_len, self.n_head, self.head_dim).permute(0, 2, 1, 3)
 
             wv = self._sdpa(q, k, v, mask=None)
 
