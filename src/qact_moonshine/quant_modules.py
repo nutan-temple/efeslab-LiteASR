@@ -36,10 +36,10 @@ class SwitchLayerNorm(nn.Module, QuantModule):
     """Switchable LayerNorm for multi-precision inference.
     Adapted from https://github.com/JiahuiYu/slimmable_networks
     """
-    def __init__(self, num_features, bit_list=[8, 4, 2]):
+    def __init__(self, num_features, bit_list=None):
         super(SwitchLayerNorm, self).__init__()
         self.precision_level = 8
-        self.bit_list = bit_list
+        self.bit_list = bit_list if bit_list is not None else [8, 4, 2]
         self.ln_dict = nn.ModuleDict()
         for i in self.bit_list:
             self.ln_dict[str(i)] = nn.LayerNorm(num_features)

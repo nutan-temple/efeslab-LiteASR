@@ -493,22 +493,13 @@ def qact_forward_pass(
         encoder_output = model.encode(input_values)
 
         # Forward pass through decoder (teacher forcing)
-        # Allocate a fresh KV cache for each pass to avoid in-place op
-        # conflicts with autograd across the 3 co-training passes.
-        dims = model.model.dims
-        kv_cache = [
-            {
-                "self-key": torch.zeros(input_values.shape[0], dims.n_text_ctx, dims.hidden_size, device=device),
-                "self-value": torch.zeros(input_values.shape[0], dims.n_text_ctx, dims.hidden_size, device=device),
-                "cross-key": torch.zeros(input_values.shape[0], model.model.max_encoder_len, dims.hidden_size, device=device),
-                "cross-value": torch.zeros(input_values.shape[0], model.model.max_encoder_len, dims.hidden_size, device=device),
-            }
-            for _ in range(dims.n_text_layer)
-        ]
+        # Pass kv_cache=None to avoid copy_() which severs gradients.
+        # The no-cache path in MultiHeadAttention computes K/V directly,
+        # preserving gradient flow through decoder key/value projections.
         decoder = model.model.decoder
         logits = decoder(
             decoder_input_ids, encoder_output,
-            offset=0, kv_cache=kv_cache, is_prefilling=True,
+            offset=0, kv_cache=None, is_prefilling=True,
         )
 
         # Reshape logits for loss computation: (B, seq_len, vocab_size)
