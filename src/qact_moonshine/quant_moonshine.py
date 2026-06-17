@@ -399,10 +399,10 @@ def load_pretrained_moonshine(
         n_text_head=config.decoder_num_attention_heads,
         n_text_layer=config.decoder_num_hidden_layers,
         n_text_ctx=config.max_position_embeddings,
-        head_dim=config.head_dim,
+        head_dim=getattr(config, 'head_dim', config.hidden_size // config.encoder_num_attention_heads),
         partial_rotary_factor=config.partial_rotary_factor,
         rope_theta=config.rope_theta,
-        pad_head_dim_to_multiple_of=8,
+        pad_head_dim_to_multiple_of=getattr(config, 'pad_head_dim_to_multiple_of', 8),
     )
 
     low_rank_config = getattr(config, 'low_rank_config', None)
