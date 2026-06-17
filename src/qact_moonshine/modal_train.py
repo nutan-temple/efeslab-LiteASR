@@ -14,7 +14,13 @@ Usage:
     modal run src/qact_moonshine/modal_train.py --epochs 50 --batch-size 32
 """
 
+from pathlib import Path
+
 import modal
+
+# Resolve the src/ directory relative to this script's location so that
+# `modal run` works regardless of the working directory.
+SRC_DIR = Path(__file__).resolve().parent.parent
 
 # ---------------------------------------------------------------------------
 # Modal App and Infrastructure
@@ -50,7 +56,7 @@ training_image = (
         "tqdm>=4.60.0",
         "pyyaml>=6.0",
     )
-    .add_local_dir("src", "/root/src")
+    .add_local_dir(str(SRC_DIR), "/root/src")
 )
 
 # ---------------------------------------------------------------------------
