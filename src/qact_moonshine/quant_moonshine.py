@@ -390,6 +390,15 @@ def load_pretrained_moonshine(
     # logic as run_moonshine.py
     config = hf_model.config
 
+    # Extract rope_theta: may be a top-level attr or nested inside rope_parameters
+    rope_theta = getattr(config, 'rope_theta', None)
+    if rope_theta is None:
+        rope_params = getattr(config, 'rope_parameters', None)
+        if rope_params and isinstance(rope_params, dict):
+            rope_theta = rope_params.get('rope_theta', 10000.0)
+        else:
+            rope_theta = 10000.0
+
     model_dims = MoonshineModelDimensions(
         hidden_size=config.hidden_size,
         intermediate_size=config.intermediate_size,
@@ -401,7 +410,7 @@ def load_pretrained_moonshine(
         n_text_ctx=config.max_position_embeddings,
         head_dim=getattr(config, 'head_dim', config.hidden_size // config.encoder_num_attention_heads),
         partial_rotary_factor=config.partial_rotary_factor,
-        rope_theta=config.rope_theta,
+        rope_theta=rope_theta,
         pad_head_dim_to_multiple_of=getattr(config, 'pad_head_dim_to_multiple_of', 8),
     )
 
@@ -462,26 +471,22 @@ def load_pretrained_moonshine(
     unmatched_keys = []
 
     for key, value in hf_state_dict.items():
-        # Remove the 'model.' prefix that HF adds
-        if key.startswith("model."):
-            key = key[len("model."):]
-        else:
-            unmatched_keys.append(key)
-            continue
+        # Strip the 'model.' prefix if present (some HF model variants add it)
+        stripped_key = key[len("model."):] if key.startswith("model.") else key
 
         matched = False
         for pattern, replacement in reverse_translation.items():
-            if re.match(pattern, key):
-                new_key = re.sub(pattern, replacement, key)
+            if re.match(pattern, stripped_key):
+                new_key = re.sub(pattern, replacement, stripped_key)
                 # Transpose weight1 and weight2 for low-rank layers
-                if key.endswith("weight1") or key.endswith("weight2"):
+                if stripped_key.endswith("weight1") or stripped_key.endswith("weight2"):
                     value = value.T.contiguous()
                 new_state_dict[new_key] = value
                 matched = True
                 break
 
         if not matched:
-            unmatched_keys.append(f"model.{key}")
+            unmatched_keys.append(key)
 
     if unmatched_keys:
         warnings.warn(
