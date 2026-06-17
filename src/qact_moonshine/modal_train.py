@@ -1,0 +1,158 @@
+"""
+Modal app for running QACT Moonshine training on cloud GPUs.
+
+This script defines a Modal application that:
+1. Builds a container image with all required dependencies.
+2. Mounts a persistent Volume at /checkpoints for saving/resuming training.
+3. Launches the QACT co-training script on an A100 GPU.
+
+Usage:
+    # Run with default settings:
+    modal run src/qact_moonshine/modal_train.py
+
+    # Run with custom arguments:
+    modal run src/qact_moonshine/modal_train.py --epochs 50 --batch-size 16
+"""
+
+import modal
+
+# ---------------------------------------------------------------------------
+# Modal App and Infrastructure
+# ---------------------------------------------------------------------------
+
+app = modal.App("qact-moonshine-training")
+
+# Persistent volume for checkpoints -- data survives across runs
+checkpoints_volume = modal.Volume.from_name(
+    "qact-moonshine-checkpoints", create_if_missing=True
+)
+
+CHECKPOINTS_DIR = "/checkpoints"
+
+# Container image with all training dependencies
+training_image = (
+    modal.Image.debian_slim(python_version="3.11")
+    .pip_install(
+        # Core ML dependencies
+        "torch==2.6.0",
+        "triton==3.2.0",
+        "transformers==4.49.0",
+        "safetensors==0.5.3",
+        # Data and audio processing
+        "datasets==3.3.2",
+        "librosa==0.10.2.post1",
+        "numba==0.61.0",
+        "numpy==2.1.3",
+        "sentencepiece==0.2.0",
+        # Evaluation
+        "evaluate==0.4.3",
+        # Utilities
+        "tqdm>=4.60.0",
+        "pyyaml>=6.0",
+    )
+    .add_local_dir("src", "/root/src")
+)
+
+# ---------------------------------------------------------------------------
+# Training Function
+# ---------------------------------------------------------------------------
+
+
+@app.function(
+    image=training_image,
+    gpu="A100",
+    volumes={CHECKPOINTS_DIR: checkpoints_volume},
+    timeout=86400,  # 24 hours max
+)
+def train(
+    epochs: int = 100,
+    batch_size: int = 8,
+    lr: float = 5e-5,
+    enc_weight_bit: int = 2,
+    mix_rate: float = 1.8,
+    model_name: str = "usefulsensors/moonshine-base",
+    dataset: str = "librispeech_asr",
+    dataset_config: str = "clean",
+    train_split: str = "train.100",
+):
+    """Run QACT co-training for Moonshine on a Modal GPU instance.
+
+    Checkpoints are saved to the persistent volume at /checkpoints so they
+    persist across runs and can be downloaded later.
+    """
+    import subprocess
+    import sys
+
+    # Build the command line for the training script
+    cmd = [
+        sys.executable,
+        "-m",
+        "qact_moonshine.train_qact_moonshine",
+        "--output-dir", CHECKPOINTS_DIR,
+        "--model-name", model_name,
+        "--epochs", str(epochs),
+        "--batch-size", str(batch_size),
+        "--lr", str(lr),
+        "--enc-weight-bit", str(enc_weight_bit),
+        "--mix-rate", str(mix_rate),
+        "--dataset", dataset,
+        "--dataset-config", dataset_config,
+        "--train-split", train_split,
+    ]
+
+    print(f"Starting QACT training with command:\n  {' '.join(cmd)}")
+    print(f"Checkpoints will be saved to: {CHECKPOINTS_DIR}")
+
+    # Run the training script as a subprocess so it uses its own argparse
+    result = subprocess.run(
+        cmd,
+        cwd="/root",
+        env={
+            **__import__("os").environ,
+            "PYTHONPATH": "/root/src",
+        },
+    )
+
+    # Commit the volume so checkpoints persist after the function exits
+    checkpoints_volume.commit()
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Training script exited with code {result.returncode}"
+        )
+
+    print("Training complete. Checkpoints saved to volume.")
+
+
+# ---------------------------------------------------------------------------
+# CLI Entrypoint (modal run)
+# ---------------------------------------------------------------------------
+
+
+@app.local_entrypoint()
+def main(
+    epochs: int = 100,
+    batch_size: int = 8,
+    lr: float = 5e-5,
+    enc_weight_bit: int = 2,
+    mix_rate: float = 1.8,
+    model_name: str = "usefulsensors/moonshine-base",
+    dataset: str = "librispeech_asr",
+    dataset_config: str = "clean",
+    train_split: str = "train.100",
+):
+    """Local entrypoint invoked by `modal run src/qact_moonshine/modal_train.py`.
+
+    Forwards all arguments to the remote training function.
+    """
+    train.remote(
+        epochs=epochs,
+        batch_size=batch_size,
+        lr=lr,
+        enc_weight_bit=enc_weight_bit,
+        mix_rate=mix_rate,
+        model_name=model_name,
+        dataset=dataset,
+        dataset_config=dataset_config,
+        train_split=train_split,
+    )
