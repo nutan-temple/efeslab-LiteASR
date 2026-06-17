@@ -513,4 +513,7 @@ def load_pretrained_moonshine(
         quant_decoder=quant_decoder,
     )
 
+    # Ensure all new quantization parameters/buffers are on the target device
+    quantized_model = quantized_model.to(device)
+
     return quantized_model
