@@ -4,6 +4,11 @@ QACT Co-Training Script for Moonshine ASR.
 Implements multi-precision co-training with stochastic precision scheduling
 and knowledge distillation (KD) loss between precision levels.
 
+Supports PyTorch DistributedDataParallel (DDP) for multi-GPU training.
+Launch with torchrun for multi-GPU:
+    torchrun --nproc_per_node=8 -m qact_moonshine.train_qact_moonshine \\
+        --output-dir /path/to/checkpoints
+
 The co-training loop performs 3 forward passes per batch:
 1. 2-bit precision: standard CE loss, stores soft targets (detached softmax of logits)
 2. 1-bit precision: KD loss = lambda_2 * LabelSoftLoss(logits, soft_targets, hard_targets)
@@ -18,15 +23,16 @@ Stochastic precision schedule (mix_rate=1.8, log-linear from paper):
     For each layer i: pick 2-bit if random() > mix_rate[i], else 1-bit
 
 Usage:
+    # Single GPU:
     python -m qact_moonshine.train_qact_moonshine --output-dir /path/to/checkpoints
 
-    # With custom config:
-    python -m qact_moonshine.train_qact_moonshine \\
+    # Multi-GPU (8 GPUs on a single node):
+    torchrun --nproc_per_node=8 -m qact_moonshine.train_qact_moonshine \\
         --output-dir /path/to/checkpoints \\
         --enc-weight-bit 2 \\
         --mix-rate 1.8 \\
         --epochs 100 \\
-        --batch-size 8
+        --batch-size 64
 """
 
 import argparse
@@ -41,8 +47,11 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 
 # Ensure src/ is on the path for sibling module imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -143,8 +152,8 @@ def parse_args(args=None):
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=8,
-        help="Training batch size",
+        default=64,
+        help="Per-GPU training batch size",
     )
     parser.add_argument(
         "--lr",
@@ -193,8 +202,8 @@ def parse_args(args=None):
     parser.add_argument(
         "--train-split",
         type=str,
-        default="train.100",
-        help="Dataset split to use for training",
+        default="train.clean.100",
+        help="Dataset split to use for training (e.g. train.clean.100 for LibriSpeech 100hrs)",
     )
     parser.add_argument(
         "--max-samples",
@@ -523,33 +532,92 @@ def qact_forward_pass(
     return total_loss
 
 
+def setup_ddp():
+    """Initialize the distributed process group if running under torchrun.
+
+    Returns:
+        Tuple of (rank, local_rank, world_size, is_distributed).
+        If not running in distributed mode, returns (0, 0, 1, False).
+    """
+    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+        rank = int(os.environ["RANK"])
+        local_rank = int(os.environ["LOCAL_RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        dist.init_process_group(backend="nccl")
+        torch.cuda.set_device(local_rank)
+        return rank, local_rank, world_size, True
+    else:
+        return 0, 0, 1, False
+
+
+def cleanup_ddp():
+    """Destroy the distributed process group if it was initialized."""
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+
 def train(args):
     """Main training loop for QACT co-training on Moonshine.
+
+    Supports both single-GPU and multi-GPU (DDP) training. When launched
+    with torchrun, automatically uses DistributedDataParallel.
 
     Args:
         args: Parsed arguments from parse_args().
     """
-    # Set random seed
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
+    # Setup distributed training
+    rank, local_rank, world_size, is_distributed = setup_ddp()
+
+    # Set random seed (offset by rank for different data ordering per GPU)
+    torch.manual_seed(args.seed + rank)
+    np.random.seed(args.seed + rank)
 
     # Device setup
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logger.info(f"Using device: {device}")
+    if is_distributed:
+        device = torch.device(f"cuda:{local_rank}")
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Create output directory
-    os.makedirs(args.output_dir, exist_ok=True)
+    if rank == 0:
+        logger.info(f"Using device: {device}")
+        if is_distributed:
+            logger.info(
+                f"Distributed training: {world_size} GPUs, "
+                f"effective batch size = {args.batch_size * world_size}"
+            )
+
+    # Create output directory (only on rank 0)
+    if rank == 0:
+        os.makedirs(args.output_dir, exist_ok=True)
+
+    # Synchronize all processes before proceeding
+    if is_distributed:
+        dist.barrier()
 
     # Load model and tokenizer
     quantized_model, tokenizer, num_encoder_layers = setup_model(args, device)
     quantized_model.train()
 
+    # Wrap with DDP if distributed
+    if is_distributed:
+        quantized_model = DDP(
+            quantized_model,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            find_unused_parameters=True,
+        )
+        # Access the underlying model for set_layerwise_precision etc.
+        raw_model = quantized_model.module
+    else:
+        raw_model = quantized_model
+
     # Compute stochastic precision schedule
     mix_rate_schedule = compute_mix_rate_schedule(args.mix_rate, num_encoder_layers)
-    logger.info(f"Mix rate schedule: {mix_rate_schedule}")
+    if rank == 0:
+        logger.info(f"Mix rate schedule: {mix_rate_schedule}")
 
     # Setup loss functions
-    vocab_size = quantized_model.model.decoder.token_embedding.weight.shape[0]
+    vocab_size = raw_model.model.decoder.token_embedding.weight.shape[0]
     pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
 
     ce_criterion = LabelSmoothingLoss(
@@ -567,14 +635,34 @@ def train(args):
     # Load dataset
     dataset = load_dataset_splits(args)
     collator = LibriSpeechCollator(tokenizer=tokenizer)
-    dataloader = DataLoader(
-        dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        collate_fn=collator,
-        pin_memory=True if device.type == "cuda" else False,
-    )
+
+    # Use DistributedSampler for multi-GPU
+    if is_distributed:
+        sampler = DistributedSampler(
+            dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True,
+            seed=args.seed,
+        )
+        dataloader = DataLoader(
+            dataset,
+            batch_size=args.batch_size,
+            sampler=sampler,
+            num_workers=args.num_workers,
+            collate_fn=collator,
+            pin_memory=True,
+            drop_last=True,
+        )
+    else:
+        dataloader = DataLoader(
+            dataset,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=args.num_workers,
+            collate_fn=collator,
+            pin_memory=True if device.type == "cuda" else False,
+        )
 
     # Setup optimizer and scheduler
     optimizer = AdamW(quantized_model.parameters(), lr=args.lr, weight_decay=0.01)
@@ -583,24 +671,29 @@ def train(args):
         optimizer, args.warmup_steps, total_steps
     )
 
-    logger.info(f"Total training steps: {total_steps}")
-    logger.info(f"Warmup steps: {args.warmup_steps}")
-    logger.info(
-        f"QACT config: lambda_1={args.lambda_1}, lambda_2={args.lambda_2}, "
-        f"mix_rate={args.mix_rate}"
-    )
+    if rank == 0:
+        logger.info(f"Total training steps: {total_steps}")
+        logger.info(f"Warmup steps: {args.warmup_steps}")
+        logger.info(
+            f"QACT config: lambda_1={args.lambda_1}, lambda_2={args.lambda_2}, "
+            f"mix_rate={args.mix_rate}"
+        )
 
     # Training loop
     global_step = 0
     optimizer.zero_grad()
     for epoch in range(args.epochs):
+        # Set epoch for DistributedSampler to shuffle data differently each epoch
+        if is_distributed:
+            sampler.set_epoch(epoch)
+
         epoch_loss = 0.0
         epoch_steps = 0
         epoch_start = time.time()
 
         for batch_idx, batch in enumerate(dataloader):
             loss = qact_forward_pass(
-                model=quantized_model,
+                model=raw_model,
                 batch=batch,
                 device=device,
                 num_encoder_layers=num_encoder_layers,
@@ -630,8 +723,8 @@ def train(args):
             epoch_loss += loss.item() * args.accum_grad
             epoch_steps += 1
 
-            # Logging
-            if (batch_idx + 1) % args.log_interval == 0:
+            # Logging (only rank 0)
+            if rank == 0 and (batch_idx + 1) % args.log_interval == 0:
                 avg_loss = epoch_loss / epoch_steps
                 lr = scheduler.get_last_lr()[0]
                 logger.info(
@@ -643,13 +736,14 @@ def train(args):
         # End of epoch
         epoch_time = time.time() - epoch_start
         avg_epoch_loss = epoch_loss / max(epoch_steps, 1)
-        logger.info(
-            f"Epoch {epoch + 1}/{args.epochs} completed in {epoch_time:.1f}s - "
-            f"Avg Loss: {avg_epoch_loss:.4f}"
-        )
+        if rank == 0:
+            logger.info(
+                f"Epoch {epoch + 1}/{args.epochs} completed in {epoch_time:.1f}s - "
+                f"Avg Loss: {avg_epoch_loss:.4f}"
+            )
 
-        # Save checkpoint
-        if (epoch + 1) % args.save_interval == 0:
+        # Save checkpoint (only rank 0)
+        if rank == 0 and (epoch + 1) % args.save_interval == 0:
             checkpoint_path = os.path.join(
                 args.output_dir, f"checkpoint_epoch_{epoch + 1}.pt"
             )
@@ -657,7 +751,7 @@ def train(args):
                 {
                     "epoch": epoch + 1,
                     "global_step": global_step,
-                    "model_state_dict": quantized_model.state_dict(),
+                    "model_state_dict": raw_model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
                     "scheduler_state_dict": scheduler.state_dict(),
                     "args": vars(args),
@@ -667,16 +761,24 @@ def train(args):
             )
             logger.info(f"Saved checkpoint: {checkpoint_path}")
 
-    # Save final model
-    final_path = os.path.join(args.output_dir, "final_model.pt")
-    torch.save(
-        {
-            "model_state_dict": quantized_model.state_dict(),
-            "args": vars(args),
-        },
-        final_path,
-    )
-    logger.info(f"Training complete! Final model saved to: {final_path}")
+        # Synchronize before next epoch
+        if is_distributed:
+            dist.barrier()
+
+    # Save final model (only rank 0)
+    if rank == 0:
+        final_path = os.path.join(args.output_dir, "final_model.pt")
+        torch.save(
+            {
+                "model_state_dict": raw_model.state_dict(),
+                "args": vars(args),
+            },
+            final_path,
+        )
+        logger.info(f"Training complete! Final model saved to: {final_path}")
+
+    # Cleanup DDP
+    cleanup_ddp()
 
 
 def main():

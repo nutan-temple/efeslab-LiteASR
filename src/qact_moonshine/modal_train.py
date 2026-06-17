@@ -4,14 +4,14 @@ Modal app for running QACT Moonshine training on cloud GPUs.
 This script defines a Modal application that:
 1. Builds a container image with all required dependencies.
 2. Mounts a persistent Volume at /checkpoints for saving/resuming training.
-3. Launches the QACT co-training script on an A100 GPU.
+3. Launches the QACT co-training script on 8x H100 GPUs using torchrun for DDP.
 
 Usage:
-    # Run with default settings:
+    # Run with default settings (8x H100, batch_size=64 per GPU):
     modal run src/qact_moonshine/modal_train.py
 
     # Run with custom arguments:
-    modal run src/qact_moonshine/modal_train.py --epochs 50 --batch-size 16
+    modal run src/qact_moonshine/modal_train.py --epochs 50 --batch-size 32
 """
 
 import modal
@@ -60,34 +60,38 @@ training_image = (
 
 @app.function(
     image=training_image,
-    gpu="A100",
+    gpu="H100:8",
     volumes={CHECKPOINTS_DIR: checkpoints_volume},
     timeout=86400,  # 24 hours max
 )
 def train(
     epochs: int = 100,
-    batch_size: int = 8,
+    batch_size: int = 64,
     lr: float = 5e-5,
     enc_weight_bit: int = 2,
     mix_rate: float = 1.8,
     model_name: str = "usefulsensors/moonshine-base",
     dataset: str = "librispeech_asr",
     dataset_config: str = "clean",
-    train_split: str = "train.100",
+    train_split: str = "train.clean.100",
 ):
-    """Run QACT co-training for Moonshine on a Modal GPU instance.
+    """Run QACT co-training for Moonshine on 8x H100 GPUs via DDP.
 
+    Uses torchrun to launch distributed training across all 8 GPUs.
+    Batch size is per-GPU, so effective batch size = batch_size * 8.
     Checkpoints are saved to the persistent volume at /checkpoints so they
     persist across runs and can be downloaded later.
     """
     import subprocess
     import sys
 
-    # Build the command line for the training script
+    # Use torchrun to launch DDP training across all 8 GPUs
     cmd = [
-        sys.executable,
-        "-m",
-        "qact_moonshine.train_qact_moonshine",
+        sys.executable, "-m", "torch.distributed.run",
+        "--nproc_per_node=8",
+        "--master_addr=127.0.0.1",
+        "--master_port=29500",
+        "-m", "qact_moonshine.train_qact_moonshine",
         "--output-dir", CHECKPOINTS_DIR,
         "--model-name", model_name,
         "--epochs", str(epochs),
@@ -100,10 +104,11 @@ def train(
         "--train-split", train_split,
     ]
 
-    print(f"Starting QACT training with command:\n  {' '.join(cmd)}")
+    print(f"Starting QACT DDP training on 8x H100 with command:\n  {' '.join(cmd)}")
+    print(f"Per-GPU batch size: {batch_size}, effective batch size: {batch_size * 8}")
     print(f"Checkpoints will be saved to: {CHECKPOINTS_DIR}")
 
-    # Run the training script as a subprocess so it uses its own argparse
+    # Run the training script via torchrun for distributed data parallel
     result = subprocess.run(
         cmd,
         cwd="/root",
@@ -132,14 +137,14 @@ def train(
 @app.local_entrypoint()
 def main(
     epochs: int = 100,
-    batch_size: int = 8,
+    batch_size: int = 64,
     lr: float = 5e-5,
     enc_weight_bit: int = 2,
     mix_rate: float = 1.8,
     model_name: str = "usefulsensors/moonshine-base",
     dataset: str = "librispeech_asr",
     dataset_config: str = "clean",
-    train_split: str = "train.100",
+    train_split: str = "train.clean.100",
 ):
     """Local entrypoint invoked by `modal run src/qact_moonshine/modal_train.py`.
 

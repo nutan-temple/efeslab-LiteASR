@@ -17,7 +17,7 @@ lambda-2: 1.0
 
 # Training settings
 epochs: 100
-batch-size: 8
+batch-size: 64
 lr: 0.00005
 warmup-steps: 1000
 grad-clip: 5.0
@@ -27,7 +27,7 @@ label-smoothing: 0.1
 # Dataset settings
 dataset: librispeech_asr
 dataset-config: clean
-train-split: train.100
+train-split: train.clean.100
 num-workers: 4
 
 # Logging and saving
