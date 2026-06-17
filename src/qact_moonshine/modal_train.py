@@ -4,10 +4,10 @@ Modal app for running QACT Moonshine training on cloud GPUs.
 This script defines a Modal application that:
 1. Builds a container image with all required dependencies.
 2. Mounts a persistent Volume at /checkpoints for saving/resuming training.
-3. Launches the QACT co-training script on 8x H100 GPUs using torchrun for DDP.
+3. Launches the QACT co-training script on 8x A100 GPUs using torchrun for DDP.
 
 Usage:
-    # Run with default settings (8x H100, batch_size=64 per GPU):
+    # Run with default settings (8x A100, batch_size=64 per GPU):
     modal run src/qact_moonshine/modal_train.py
 
     # Run with custom arguments:
@@ -60,7 +60,7 @@ training_image = (
 
 @app.function(
     image=training_image,
-    gpu="H100:8",
+    gpu="A100:8",
     volumes={CHECKPOINTS_DIR: checkpoints_volume},
     timeout=86400,  # 24 hours max
 )
@@ -75,7 +75,7 @@ def train(
     dataset_config: str = "clean",
     train_split: str = "train.clean.100",
 ):
-    """Run QACT co-training for Moonshine on 8x H100 GPUs via DDP.
+    """Run QACT co-training for Moonshine on 8x A100 GPUs via DDP.
 
     Uses torchrun to launch distributed training across all 8 GPUs.
     Batch size is per-GPU, so effective batch size = batch_size * 8.
@@ -104,7 +104,7 @@ def train(
         "--train-split", train_split,
     ]
 
-    print(f"Starting QACT DDP training on 8x H100 with command:\n  {' '.join(cmd)}")
+    print(f"Starting QACT DDP training on 8x A100 with command:\n  {' '.join(cmd)}")
     print(f"Per-GPU batch size: {batch_size}, effective batch size: {batch_size * 8}")
     print(f"Checkpoints will be saved to: {CHECKPOINTS_DIR}")
 
