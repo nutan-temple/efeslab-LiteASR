@@ -449,6 +449,10 @@ def setup_model(args, device):
     logger.info(f"Loading model: {args.model_name}")
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
 
+    # Moonshine tokenizer doesn't define a pad token; use eos_token for padding
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
     quantized_model = load_pretrained_moonshine(
         model_name=args.model_name,
         device=str(device),
