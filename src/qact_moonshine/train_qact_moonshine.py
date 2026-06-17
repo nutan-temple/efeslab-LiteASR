@@ -4,23 +4,31 @@ QACT Co-Training Script for Moonshine ASR.
 Implements multi-precision co-training with stochastic precision scheduling
 and knowledge distillation (KD) loss between precision levels.
 
+Supports full model quantization with component-wise precision:
+- Encoder attention + MLP: 2-bit (co-trained with 1-bit via stochastic precision)
+- Encoder Conv frontend (conv1, conv2, conv3): 4-bit (fixed, conv layers are sensitive)
+- Decoder (self-attn, cross-attn, MLP): 4-bit (fixed, no co-training at this level)
+- Embeddings & LayerNorms: Full precision (unquantized)
+- Weight-only quantization: activations stay in FP32/FP16
+
+The QACT co-training 3-pass loop (2-bit teacher, 1-bit student, stochastic mixed)
+applies ONLY to the encoder. The decoder at 4-bit gets standard QAT -- it is
+included in all 3 forward passes but always at 4-bit, so it benefits from the
+training signal without precision switching. The conv frontend is similarly fixed.
+
 Supports PyTorch DistributedDataParallel (DDP) for multi-GPU training.
 Launch with torchrun for multi-GPU:
     torchrun --nproc_per_node=8 -m qact_moonshine.train_qact_moonshine \\
         --output-dir /path/to/checkpoints
 
 The co-training loop performs 3 forward passes per batch:
-1. 2-bit precision: standard CE loss, stores soft targets (detached softmax of logits)
-2. 1-bit precision: KD loss = lambda_2 * LabelSoftLoss(logits, soft_targets, hard_targets)
-                              + lambda_1 * CE(logits, hard_targets)
-3. Stochastic-mixed precision: same KD loss formula as pass 2
+1. 2-bit encoder precision: standard CE loss, stores soft targets (detached softmax)
+2. 1-bit encoder precision: KD loss = lambda_2 * LabelSoftLoss + lambda_1 * CE
+3. Stochastic-mixed encoder precision: same KD loss formula as pass 2
 
 Final loss = (loss_1 + loss_2 + loss_3) / 3
 
-Stochastic precision schedule (mix_rate=1.8, log-linear from paper):
-    a = numpy.linspace(numpy.exp(0.2), numpy.exp(0.8), num_encoder_layers)
-    mix_rate_per_layer = numpy.log(a / 0.9)
-    For each layer i: pick 2-bit if random() > mix_rate[i], else 1-bit
+Decoder and conv stay at fixed 4-bit throughout all 3 passes.
 
 Usage:
     # Single GPU:
@@ -30,6 +38,8 @@ Usage:
     torchrun --nproc_per_node=8 -m qact_moonshine.train_qact_moonshine \\
         --output-dir /path/to/checkpoints \\
         --enc-weight-bit 2 \\
+        --dec-weight-bit 4 \\
+        --conv-weight-bit 4 \\
         --mix-rate 1.8 \\
         --epochs 100 \\
         --batch-size 64
@@ -100,7 +110,19 @@ def parse_args(args=None):
         "--enc-weight-bit",
         type=int,
         default=2,
-        help="Default weight bit-width for encoder quantization",
+        help="Default weight bit-width for encoder attention/MLP quantization",
+    )
+    parser.add_argument(
+        "--dec-weight-bit",
+        type=int,
+        default=4,
+        help="Weight bit-width for decoder quantization (fixed, no co-training)",
+    )
+    parser.add_argument(
+        "--conv-weight-bit",
+        type=int,
+        default=4,
+        help="Weight bit-width for encoder conv frontend quantization (fixed)",
     )
     parser.add_argument(
         "--use-scaling",
@@ -118,8 +140,14 @@ def parse_args(args=None):
     parser.add_argument(
         "--quant-decoder",
         action="store_true",
-        default=False,
-        help="Whether to also quantize decoder layers",
+        default=True,
+        help="Whether to also quantize decoder layers (enabled by default)",
+    )
+    parser.add_argument(
+        "--no-quant-decoder",
+        action="store_false",
+        dest="quant_decoder",
+        help="Disable decoder quantization",
     )
 
     # QACT co-training hyperparameters
@@ -424,7 +452,9 @@ def setup_model(args, device):
     quantized_model = load_pretrained_moonshine(
         model_name=args.model_name,
         device=str(device),
-        weight_bit=args.enc_weight_bit,
+        enc_weight_bit=args.enc_weight_bit,
+        dec_weight_bit=args.dec_weight_bit,
+        conv_weight_bit=args.conv_weight_bit,
         use_scaling=args.use_scaling,
         quant_mode=args.quant_mode,
         quant_decoder=args.quant_decoder,
@@ -433,8 +463,10 @@ def setup_model(args, device):
     num_encoder_layers = len(quantized_model.encoder_layer_quant_modules)
     logger.info(f"Model loaded with {num_encoder_layers} encoder layers")
     logger.info(
-        f"Quantization: {args.enc_weight_bit}-bit, "
-        f"use_scaling={args.use_scaling}, mode={args.quant_mode}"
+        f"Quantization: enc={args.enc_weight_bit}-bit, "
+        f"dec={args.dec_weight_bit}-bit, conv={args.conv_weight_bit}-bit, "
+        f"use_scaling={args.use_scaling}, mode={args.quant_mode}, "
+        f"quant_decoder={args.quant_decoder}"
     )
 
     return quantized_model, tokenizer, num_encoder_layers
@@ -452,12 +484,18 @@ def qact_forward_pass(
     soft_criterion,
     vocab_size,
     pad_token_id,
+    dec_weight_bit=4,
+    conv_weight_bit=4,
 ):
     """Perform the QACT co-training forward pass with 3 sub-passes.
 
-    Pass 1 (2-bit): Standard CE loss, stores soft targets.
-    Pass 2 (1-bit): KD loss = lambda_2 * LabelSoftLoss + lambda_1 * CE.
-    Pass 3 (stochastic-mixed): Same KD loss formula as pass 2.
+    The co-training (multi-pass with 2-bit teacher, 1-bit student, stochastic mixed)
+    applies ONLY to the encoder. The decoder stays at fixed dec_weight_bit (4-bit)
+    throughout all 3 passes. The conv frontend stays at fixed conv_weight_bit (4-bit).
+
+    Pass 1 (encoder 2-bit): Standard CE loss, stores soft targets.
+    Pass 2 (encoder 1-bit): KD loss = lambda_2 * LabelSoftLoss + lambda_1 * CE.
+    Pass 3 (encoder stochastic-mixed): Same KD loss formula as pass 2.
 
     Args:
         model: QuantizedMoonshine model.
@@ -471,6 +509,8 @@ def qact_forward_pass(
         soft_criterion: LabelSoftLoss instance.
         vocab_size: Vocabulary size for the model.
         pad_token_id: Padding token ID for ignoring in loss.
+        dec_weight_bit: Fixed bit-width for decoder (default 4).
+        conv_weight_bit: Fixed bit-width for conv frontend (default 4).
 
     Returns:
         Averaged loss over all 3 passes.
@@ -484,7 +524,7 @@ def qact_forward_pass(
     decoder_input_ids = labels[:, :-1].contiguous()
     targets = labels[:, 1:].contiguous()
 
-    # Define the precision configurations for 3 passes
+    # Define the precision configurations for 3 passes (ENCODER ONLY)
     prec_2bit = [2] * num_encoder_layers
     prec_1bit = [1] * num_encoder_layers
     prec_mixed = sample_stochastic_precision(mix_rate_schedule)
@@ -494,9 +534,17 @@ def qact_forward_pass(
     soft_targets = None
 
     for pass_idx, prec_list in enumerate(precision_configs):
-        # Set encoder precision for this pass
+        # Set encoder precision for this pass (varies per pass for co-training)
         model.set_layerwise_precision(prec_list)
-        model.set_encoder_conv_precision(prec_list[0])
+
+        # Conv frontend stays at fixed precision (no co-training)
+        model.set_encoder_conv_precision(conv_weight_bit)
+
+        # Decoder stays at fixed precision throughout all passes
+        # (included in training signal but no precision switching)
+        if model.quant_decoder:
+            num_decoder_layers = len(model.decoder_layer_quant_modules)
+            model.set_decoder_layerwise_precision([dec_weight_bit] * num_decoder_layers)
 
         # Forward pass through encoder
         encoder_output = model.encode(input_values)
@@ -676,7 +724,8 @@ def train(args):
         logger.info(f"Warmup steps: {args.warmup_steps}")
         logger.info(
             f"QACT config: lambda_1={args.lambda_1}, lambda_2={args.lambda_2}, "
-            f"mix_rate={args.mix_rate}"
+            f"mix_rate={args.mix_rate}, dec_weight_bit={args.dec_weight_bit}, "
+            f"conv_weight_bit={args.conv_weight_bit}"
         )
 
     # Training loop
@@ -704,6 +753,8 @@ def train(args):
                 soft_criterion=soft_criterion,
                 vocab_size=vocab_size,
                 pad_token_id=pad_token_id,
+                dec_weight_bit=args.dec_weight_bit,
+                conv_weight_bit=args.conv_weight_bit,
             )
 
             # Scale loss for gradient accumulation

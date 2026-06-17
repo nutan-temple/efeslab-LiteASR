@@ -71,11 +71,41 @@ def parse_args(args=None):
         help="HuggingFace model name (must match training)",
     )
     parser.add_argument(
+        "--enc-weight-bit",
+        type=int,
+        default=2,
+        help="Encoder attention/MLP weight bit-width (must match training)",
+    )
+    parser.add_argument(
+        "--dec-weight-bit",
+        type=int,
+        default=4,
+        help="Decoder weight bit-width (must match training)",
+    )
+    parser.add_argument(
+        "--conv-weight-bit",
+        type=int,
+        default=4,
+        help="Encoder conv frontend weight bit-width (must match training)",
+    )
+    parser.add_argument(
+        "--quant-decoder",
+        action="store_true",
+        default=True,
+        help="Whether decoder was quantized during training (enabled by default)",
+    )
+    parser.add_argument(
+        "--no-quant-decoder",
+        action="store_false",
+        dest="quant_decoder",
+        help="Disable decoder quantization (must match training config)",
+    )
+    parser.add_argument(
         "--precision",
         type=int,
         default=2,
         help=(
-            "Precision level for evaluation. Codes: "
+            "Encoder precision level for evaluation. Codes: "
             "1=all 1-bit, 2=all 2-bit, "
             "11=first-half 1-bit/second-half 2-bit, "
             "12=first-half 2-bit/second-half 1-bit, "
@@ -165,13 +195,14 @@ def precision_code_to_list(precision: int, num_layers: int) -> List[int]:
         )
 
 
-def load_quantized_model(checkpoint_path, model_name, device):
+def load_quantized_model(checkpoint_path, model_name, device, args=None):
     """Load a QACT-trained quantized model from checkpoint.
 
     Args:
         checkpoint_path: Path to the saved checkpoint.
         model_name: HuggingFace model name used during training.
         device: Device to load on.
+        args: Optional parsed args with enc/dec/conv bit-width overrides.
 
     Returns:
         Tuple of (quantized_model, training_args_dict).
@@ -182,14 +213,22 @@ def load_quantized_model(checkpoint_path, model_name, device):
     # Get training args from checkpoint
     train_args = checkpoint.get("args", {})
 
+    # Use command-line args if provided, otherwise fall back to checkpoint args
+    enc_weight_bit = args.enc_weight_bit if args else train_args.get("enc_weight_bit", 2)
+    dec_weight_bit = args.dec_weight_bit if args else train_args.get("dec_weight_bit", 4)
+    conv_weight_bit = args.conv_weight_bit if args else train_args.get("conv_weight_bit", 4)
+    quant_decoder = args.quant_decoder if args else train_args.get("quant_decoder", True)
+
     # Recreate the quantized model with the same configuration
     quantized_model = load_pretrained_moonshine(
         model_name=model_name,
         device=str(device),
-        weight_bit=train_args.get("enc_weight_bit", 2),
+        enc_weight_bit=enc_weight_bit,
+        dec_weight_bit=dec_weight_bit,
+        conv_weight_bit=conv_weight_bit,
         use_scaling=train_args.get("use_scaling", True),
         quant_mode=train_args.get("quant_mode", "symmetric"),
-        quant_decoder=train_args.get("quant_decoder", False),
+        quant_decoder=quant_decoder,
     )
 
     # Load trained weights
@@ -199,16 +238,18 @@ def load_quantized_model(checkpoint_path, model_name, device):
     return quantized_model, train_args
 
 
-def evaluate_wer(model, tokenizer, dataset, precision_list, device, max_samples=None):
+def evaluate_wer(model, tokenizer, dataset, precision_list, device, max_samples=None, conv_weight_bit=4, dec_weight_bit=4):
     """Evaluate WER on a dataset at a specific precision level.
 
     Args:
         model: QuantizedMoonshine model.
         tokenizer: HuggingFace tokenizer.
         dataset: HuggingFace dataset with audio and text.
-        precision_list: Per-layer precision configuration.
+        precision_list: Per-layer encoder precision configuration.
         device: Computation device.
         max_samples: Optional limit on number of samples.
+        conv_weight_bit: Bit-width for encoder conv frontend.
+        dec_weight_bit: Bit-width for decoder layers.
 
     Returns:
         WER as a float (0-1 range).
@@ -218,7 +259,12 @@ def evaluate_wer(model, tokenizer, dataset, precision_list, device, max_samples=
 
     model.eval()
     model.set_layerwise_precision(precision_list)
-    model.set_encoder_conv_precision(precision_list[0])
+    model.set_encoder_conv_precision(conv_weight_bit)
+
+    # Set decoder precision if decoder is quantized
+    if model.quant_decoder:
+        num_decoder_layers = len(model.decoder_layer_quant_modules)
+        model.set_decoder_layerwise_precision([dec_weight_bit] * num_decoder_layers)
 
     wer_metric = hf_evaluate.load("wer")
     all_predictions = []
@@ -321,7 +367,7 @@ def main(args=None):
     from transformers import AutoTokenizer
 
     quantized_model, train_args = load_quantized_model(
-        args.checkpoint, args.model_name, device
+        args.checkpoint, args.model_name, device, args=args
     )
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
 
@@ -332,8 +378,12 @@ def main(args=None):
     precision_list = precision_code_to_list(args.precision, num_layers)
     avg_bits = sum(precision_list) / len(precision_list)
     logger.info(
-        f"Precision config (code={args.precision}): {precision_list} "
+        f"Encoder precision config (code={args.precision}): {precision_list} "
         f"(avg {avg_bits:.2f} bits)"
+    )
+    logger.info(
+        f"Conv precision: {args.conv_weight_bit}-bit, "
+        f"Decoder precision: {args.dec_weight_bit}-bit"
     )
 
     # Load dataset
@@ -357,6 +407,8 @@ def main(args=None):
         precision_list=precision_list,
         device=device,
         max_samples=args.max_samples,
+        conv_weight_bit=args.conv_weight_bit,
+        dec_weight_bit=args.dec_weight_bit,
     )
     wer_pct = round(100 * wer, 2)
 
@@ -366,9 +418,10 @@ def main(args=None):
     print("=" * 60)
     print(f"Model:           {args.model_name}")
     print(f"Checkpoint:      {args.checkpoint}")
-    print(f"Precision code:  {args.precision}")
-    print(f"Precision list:  {precision_list}")
-    print(f"Average bits:    {avg_bits:.2f}")
+    print(f"Enc precision:   code={args.precision}, list={precision_list}")
+    print(f"Conv precision:  {args.conv_weight_bit}-bit")
+    print(f"Dec precision:   {args.dec_weight_bit}-bit")
+    print(f"Average enc bits:{avg_bits:.2f}")
     print(f"Dataset:         {args.dataset} ({args.dataset_config}, {args.split})")
     print(f"Samples:         {args.max_samples or 'all'}")
     print(f"Word Error Rate: {wer_pct}%")

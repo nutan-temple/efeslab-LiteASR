@@ -69,6 +69,8 @@ def train(
     batch_size: int = 64,
     lr: float = 5e-5,
     enc_weight_bit: int = 2,
+    dec_weight_bit: int = 4,
+    conv_weight_bit: int = 4,
     mix_rate: float = 1.8,
     model_name: str = "usefulsensors/moonshine-base",
     dataset: str = "librispeech_asr",
@@ -81,6 +83,11 @@ def train(
     Batch size is per-GPU, so effective batch size = batch_size * 8.
     Checkpoints are saved to the persistent volume at /checkpoints so they
     persist across runs and can be downloaded later.
+
+    Component-wise precision:
+    - Encoder attention/MLP: enc_weight_bit (default 2-bit, co-trained with 1-bit)
+    - Encoder conv frontend: conv_weight_bit (default 4-bit)
+    - Decoder: dec_weight_bit (default 4-bit, fixed)
     """
     import subprocess
     import sys
@@ -98,10 +105,13 @@ def train(
         "--batch-size", str(batch_size),
         "--lr", str(lr),
         "--enc-weight-bit", str(enc_weight_bit),
+        "--dec-weight-bit", str(dec_weight_bit),
+        "--conv-weight-bit", str(conv_weight_bit),
         "--mix-rate", str(mix_rate),
         "--dataset", dataset,
         "--dataset-config", dataset_config,
         "--train-split", train_split,
+        "--quant-decoder",
     ]
 
     print(f"Starting QACT DDP training on 8x A100 with command:\n  {' '.join(cmd)}")
@@ -140,6 +150,8 @@ def main(
     batch_size: int = 64,
     lr: float = 5e-5,
     enc_weight_bit: int = 2,
+    dec_weight_bit: int = 4,
+    conv_weight_bit: int = 4,
     mix_rate: float = 1.8,
     model_name: str = "usefulsensors/moonshine-base",
     dataset: str = "librispeech_asr",
@@ -155,6 +167,8 @@ def main(
         batch_size=batch_size,
         lr=lr,
         enc_weight_bit=enc_weight_bit,
+        dec_weight_bit=dec_weight_bit,
+        conv_weight_bit=conv_weight_bit,
         mix_rate=mix_rate,
         model_name=model_name,
         dataset=dataset,

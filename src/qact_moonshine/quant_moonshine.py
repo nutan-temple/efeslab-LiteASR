@@ -85,14 +85,23 @@ class QuantizedMoonshine(nn.Module):
     to enable low-bit weight quantization with learnable scaling factors.
 
     Supports:
-    - Encoder Conv1d frontend quantization (conv1, conv2, conv3)
-    - Encoder block attention (q/k/v/out) and MLP (fc1/fc2) quantization
-    - Optional decoder quantization (self_attn, cross_attn, MLP)
+    - Encoder Conv1d frontend quantization (conv1, conv2, conv3) at conv_weight_bit
+    - Encoder block attention (q/k/v/out) and MLP (fc1/fc2) at enc_weight_bit
+    - Optional decoder quantization (self_attn, cross_attn, MLP) at dec_weight_bit
     - Per-layer precision control via set_layerwise_precision()
+
+    Component-wise precision allows different bit-widths per component:
+    - Encoder attention + MLP: 2-bit (co-trained with 1-bit via stochastic precision)
+    - Encoder Conv frontend: 4-bit (conv layers are more sensitive)
+    - Decoder (self-attn, cross-attn, MLP): 4-bit (fixed, no co-training needed)
+    - Embeddings & LayerNorms: Full precision (unquantized)
+    - Weight-only quantization: activations stay in FP32/FP16
 
     Args:
         model: A pretrained Moonshine model instance.
-        weight_bit: Default number of bits for quantization.
+        enc_weight_bit: Number of bits for encoder attention/MLP quantization.
+        dec_weight_bit: Number of bits for decoder quantization.
+        conv_weight_bit: Number of bits for encoder conv frontend quantization.
         use_scaling: Whether to use learnable per-precision scaling factors.
         quant_mode: Quantization mode ('symmetric' or 'asymmetric').
         quant_decoder: Whether to also quantize decoder layers.
@@ -101,17 +110,24 @@ class QuantizedMoonshine(nn.Module):
     def __init__(
         self,
         model: Moonshine,
-        weight_bit: int = 2,
+        enc_weight_bit: int = 2,
+        dec_weight_bit: int = 4,
+        conv_weight_bit: int = 4,
         use_scaling: bool = True,
         quant_mode: str = 'symmetric',
-        quant_decoder: bool = False,
+        quant_decoder: bool = True,
     ):
         super().__init__()
         self.model = model
-        self.weight_bit = weight_bit
+        self.enc_weight_bit = enc_weight_bit
+        self.dec_weight_bit = dec_weight_bit
+        self.conv_weight_bit = conv_weight_bit
         self.use_scaling = use_scaling
         self.quant_mode = quant_mode
         self.quant_decoder = quant_decoder
+
+        # Keep legacy attribute for backward compatibility
+        self.weight_bit = enc_weight_bit
 
         # Track quantized layers per encoder layer for set_layerwise_precision
         self.encoder_layer_quant_modules: List[List[nn.Module]] = []
@@ -127,18 +143,26 @@ class QuantizedMoonshine(nn.Module):
             self.decoder_layer_quant_modules: List[List[nn.Module]] = []
             self._quant_decoder_blocks()
 
-    def _get_quant_kwargs(self):
-        """Common kwargs for quantize_linear/quantize_conv1d."""
+    def _get_quant_kwargs(self, weight_bit: Optional[int] = None):
+        """Common kwargs for quantize_linear/quantize_conv1d.
+
+        Args:
+            weight_bit: Override bit-width. If None, uses enc_weight_bit.
+        """
         return dict(
-            weight_bit=self.weight_bit,
+            weight_bit=weight_bit if weight_bit is not None else self.enc_weight_bit,
             use_scaling=self.use_scaling,
             quant_mode=self.quant_mode,
         )
 
     def _quant_encoder_convs(self):
-        """Replace encoder conv1, conv2, conv3 with QuantConv1d."""
+        """Replace encoder conv1, conv2, conv3 with QuantConv1d.
+
+        Uses conv_weight_bit (default 4-bit) since conv layers are more
+        sensitive to quantization than attention/MLP layers.
+        """
         encoder = self.model.encoder
-        kwargs = self._get_quant_kwargs()
+        kwargs = self._get_quant_kwargs(weight_bit=self.conv_weight_bit)
 
         encoder.conv1 = quantize_conv1d(encoder.conv1, **kwargs)
         encoder.conv2 = quantize_conv1d(encoder.conv2, **kwargs)
@@ -150,9 +174,13 @@ class QuantizedMoonshine(nn.Module):
         ]
 
     def _quant_encoder_blocks(self):
-        """Replace all Linear layers in encoder blocks with QuantLinear."""
+        """Replace all Linear layers in encoder blocks with QuantLinear.
+
+        Uses enc_weight_bit (default 2-bit) for encoder attention and MLP.
+        These layers participate in QACT co-training with stochastic precision.
+        """
         encoder = self.model.encoder
-        kwargs = self._get_quant_kwargs()
+        kwargs = self._get_quant_kwargs(weight_bit=self.enc_weight_bit)
 
         for block in encoder.blocks:
             layer_modules = []
@@ -177,9 +205,15 @@ class QuantizedMoonshine(nn.Module):
             self.encoder_layer_quant_modules.append(layer_modules)
 
     def _quant_decoder_blocks(self):
-        """Replace all Linear layers in decoder blocks with QuantLinear."""
+        """Replace all Linear layers in decoder blocks with QuantLinear.
+
+        Uses dec_weight_bit (default 4-bit) for decoder self-attn, cross-attn,
+        and MLP layers. The decoder uses fixed precision (no co-training needed
+        at 4-bit since it is stable at this precision). Lower than 4-bit causes
+        error accumulation in autoregressive decoding.
+        """
         decoder = self.model.decoder
-        kwargs = self._get_quant_kwargs()
+        kwargs = self._get_quant_kwargs(weight_bit=self.dec_weight_bit)
 
         for block in decoder.blocks:
             layer_modules = []
@@ -315,20 +349,31 @@ class QuantizedMoonshine(nn.Module):
 def load_pretrained_moonshine(
     model_name: str = "usefulsensors/moonshine-base",
     device: str = "cpu",
-    weight_bit: int = 2,
+    enc_weight_bit: int = 2,
+    dec_weight_bit: int = 4,
+    conv_weight_bit: int = 4,
     use_scaling: bool = True,
     quant_mode: str = 'symmetric',
-    quant_decoder: bool = False,
+    quant_decoder: bool = True,
 ) -> QuantizedMoonshine:
     """Load a pretrained Moonshine model from HuggingFace and wrap with quantization.
 
     Downloads the model from HuggingFace, converts it to the custom Moonshine
     architecture, and wraps all Linear/Conv1d layers with QACT quantization.
 
+    Supports component-wise precision:
+    - Encoder attention/MLP: enc_weight_bit (default 2-bit, co-trained with 1-bit)
+    - Encoder conv frontend: conv_weight_bit (default 4-bit, higher precision)
+    - Decoder: dec_weight_bit (default 4-bit, fixed precision)
+    - Embeddings & LayerNorms: Full precision (unquantized)
+    - Weight-only: activations remain in FP32/FP16
+
     Args:
         model_name: HuggingFace model identifier (e.g., 'usefulsensors/moonshine-base').
         device: Device to load the model on ('cpu' or 'cuda').
-        weight_bit: Default number of bits for weight quantization.
+        enc_weight_bit: Number of bits for encoder attention/MLP weight quantization.
+        dec_weight_bit: Number of bits for decoder weight quantization.
+        conv_weight_bit: Number of bits for encoder conv frontend weight quantization.
         use_scaling: Whether to use learnable scaling factors per precision.
         quant_mode: Quantization mode ('symmetric' or 'asymmetric').
         quant_decoder: Whether to quantize decoder layers.
@@ -455,7 +500,9 @@ def load_pretrained_moonshine(
     # Wrap with quantization
     quantized_model = QuantizedMoonshine(
         model=moonshine_model,
-        weight_bit=weight_bit,
+        enc_weight_bit=enc_weight_bit,
+        dec_weight_bit=dec_weight_bit,
+        conv_weight_bit=conv_weight_bit,
         use_scaling=use_scaling,
         quant_mode=quant_mode,
         quant_decoder=quant_decoder,
