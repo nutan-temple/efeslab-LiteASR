@@ -230,8 +230,8 @@ def parse_args(args=None):
     parser.add_argument(
         "--train-split",
         type=str,
-        default="train.clean.100",
-        help="Dataset split to use for training (e.g. train.clean.100 for LibriSpeech 100hrs)",
+        default="train.100",
+        help="Dataset split to use for training (e.g. train.100 for LibriSpeech 100hrs)",
     )
     parser.add_argument(
         "--max-samples",

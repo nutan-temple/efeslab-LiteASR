@@ -81,7 +81,7 @@ def train(
     model_name: str = "usefulsensors/moonshine-base",
     dataset: str = "librispeech_asr",
     dataset_config: str = "clean",
-    train_split: str = "train.clean.100",
+    train_split: str = "train.100",
 ):
     """Run QACT co-training for Moonshine on 8x A100 GPUs via DDP.
 
@@ -162,7 +162,7 @@ def main(
     model_name: str = "usefulsensors/moonshine-base",
     dataset: str = "librispeech_asr",
     dataset_config: str = "clean",
-    train_split: str = "train.clean.100",
+    train_split: str = "train.100",
 ):
     """Local entrypoint invoked by `modal run src/qact_moonshine/modal_train.py`.
 

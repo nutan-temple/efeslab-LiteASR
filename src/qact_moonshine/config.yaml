@@ -38,7 +38,7 @@ label-smoothing: 0.1
 # Dataset settings
 dataset: librispeech_asr
 dataset-config: clean
-train-split: train.clean.100
+train-split: train.100
 num-workers: 4
 
 # Logging and saving
