@@ -17,11 +17,11 @@ class LabelSmoothingLoss(nn.Module):
         padding_idx,
         smoothing,
         normalize_length=False,
-        criterion=nn.KLDivLoss(reduction="none"),
+        criterion=None,
     ):
         """Construct an LabelSmoothingLoss object."""
         super(LabelSmoothingLoss, self).__init__()
-        self.criterion = criterion
+        self.criterion = criterion if criterion is not None else nn.KLDivLoss(reduction="none")
         self.padding_idx = padding_idx
         self.confidence = 1.0 - smoothing
         self.smoothing = smoothing
@@ -70,11 +70,11 @@ class LabelSoftLoss(nn.Module):
         size,
         padding_idx,
         normalize_length=False,
-        criterion=nn.KLDivLoss(reduction="none"),
+        criterion=None,
     ):
         """Construct an LabelSoftLoss object."""
         super(LabelSoftLoss, self).__init__()
-        self.criterion = criterion
+        self.criterion = criterion if criterion is not None else nn.KLDivLoss(reduction="none")
         self.padding_idx = padding_idx
         self.size = size
         self.normalize_length = normalize_length

@@ -241,38 +241,57 @@ def evaluate_wer(model, tokenizer, dataset, precision_list, device, max_samples=
             waveform = torch.tensor(audio, dtype=torch.float32).unsqueeze(0).to(device)
             encoder_output = model.encode(waveform)
 
-            # Greedy decoding
+            # Greedy decoding with proper KV cache management
             decoder = model.model.decoder
             # Start with BOS token
             bos_token_id = tokenizer.bos_token_id
             if bos_token_id is None:
                 bos_token_id = tokenizer.pad_token_id or 0
 
-            generated_ids = [bos_token_id]
+            # Reset KV cache for each new utterance
+            model.model.reinit_kv_cache()
+            kv_cache = model.model.kv_cache
+
+            # Prefill with BOS token
+            input_ids = torch.tensor(
+                [[bos_token_id]], dtype=torch.long, device=device
+            )
+            logits = decoder(input_ids, encoder_output, offset=0, kv_cache=kv_cache, is_prefilling=True)
+
+            # Take the last token's logits for next prediction
+            if logits.dim() == 3:
+                next_token_logits = logits[:, -1, :]
+            else:
+                next_token_logits = logits[-1:, :]
+            next_token = torch.argmax(next_token_logits, dim=-1).item()
+
+            generated_ids = []
+            offset = 1  # We already processed the BOS token
             max_len = 256
 
             for _ in range(max_len):
-                input_ids = torch.tensor(
-                    [generated_ids], dtype=torch.long, device=device
-                )
-                logits = decoder(input_ids, encoder_output)
+                if next_token == tokenizer.eos_token_id:
+                    break
 
-                # Take the last token's logits
+                generated_ids.append(next_token)
+
+                # Generate next token autoregressively
+                input_ids = torch.tensor(
+                    [[next_token]], dtype=torch.long, device=device
+                )
+                logits = decoder(input_ids, encoder_output, offset=offset, kv_cache=kv_cache, is_prefilling=False)
+
                 if logits.dim() == 3:
                     next_token_logits = logits[:, -1, :]
                 else:
                     next_token_logits = logits[-1:, :]
 
                 next_token = torch.argmax(next_token_logits, dim=-1).item()
-
-                if next_token == tokenizer.eos_token_id:
-                    break
-
-                generated_ids.append(next_token)
+                offset += 1
 
             # Decode tokens to text
             pred_text = tokenizer.decode(
-                generated_ids[1:], skip_special_tokens=True
+                generated_ids, skip_special_tokens=True
             )
 
             all_predictions.append(pred_text.lower().strip())
