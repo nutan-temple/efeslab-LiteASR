@@ -74,9 +74,13 @@ def train_remote(
     feature: str = "logmel_40",
     preproc: str = "hp_peak_crop",
     window_seconds: float = 2.5,
-    fmin: float = 50.0,
-    fmax: float = 500.0,
-    hp_cutoff: float = 40.0,
+    fmin: float = 40.0,
+    fmax: float = 1000.0,
+    hp_cutoff: float = 25.0,
+    win_length: int = 128,
+    n_fft: int = 512,
+    hop: int = 64,
+    max_folds: int = 0,
     specaug: bool = True,
 ):
     import sys
@@ -91,8 +95,8 @@ def train_remote(
     print("device:", device)
     os.makedirs(OUT_DIR, exist_ok=True)
 
-    mel_cfg = dict(sample_rate=target_sr, n_fft=512, hop_length=64, n_mels=40,
-                   feature=feature, preproc=preproc, window_seconds=window_seconds,
+    mel_cfg = dict(sample_rate=target_sr, n_fft=n_fft, hop_length=hop, win_length=win_length,
+                   n_mels=40, feature=feature, preproc=preproc, window_seconds=window_seconds,
                    fmin=fmin, fmax=fmax, hp_cutoff=hp_cutoff)
     cfg = dict(
         wav_dir=WAV_DIR,
@@ -121,6 +125,10 @@ def train_remote(
         fmin=fmin,
         fmax=fmax,
         hp_cutoff=hp_cutoff,
+        win_length=win_length,
+        n_fft=n_fft,
+        hop=hop,
+        max_folds=max_folds,
         specaug=specaug,
         num_workers=4,
     )
@@ -240,7 +248,13 @@ def main(
     feature: str = "logmel_40",
     preproc: str = "hp_peak_crop",
     window_seconds: float = 2.5,
-    hp_cutoff: float = 40.0,
+    hp_cutoff: float = 25.0,
+    fmin: float = 40.0,
+    fmax: float = 1000.0,
+    win_length: int = 128,
+    n_fft: int = 512,
+    hop: int = 64,
+    max_folds: int = 0,
 ):
     summary = train_remote.remote(
         tau=tau,
@@ -259,6 +273,12 @@ def main(
         preproc=preproc,
         window_seconds=window_seconds,
         hp_cutoff=hp_cutoff,
+        fmin=fmin,
+        fmax=fmax,
+        win_length=win_length,
+        n_fft=n_fft,
+        hop=hop,
+        max_folds=max_folds,
     )
     if summary.get("mode") == "loso":
         keys = ("pooled_acc", "pooled_macro_f1", "fold_macro_f1_mean",

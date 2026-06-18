@@ -16,18 +16,18 @@ import torch.nn as nn
 import torchaudio
 
 from .dataset import TARGET_SR
-from .preprocessing import FMAX, FMIN, HOP, N_FFT
+from .preprocessing import FMAX, FMIN, HOP, N_FFT, WIN_LENGTH
 
 REQUIRED_N_MELS = 40
 
 
 class LogMel(nn.Module):
     def __init__(self, sample_rate=TARGET_SR, n_fft=N_FFT, hop=HOP, n_mels=40,
-                 f_min=FMIN, f_max=FMAX, deltas=False):
+                 f_min=FMIN, f_max=FMAX, win_length=WIN_LENGTH, deltas=False):
         super().__init__()
         self.deltas = deltas
         self.mel = torchaudio.transforms.MelSpectrogram(
-            sample_rate=sample_rate, n_fft=n_fft, hop_length=hop,
+            sample_rate=sample_rate, n_fft=n_fft, win_length=win_length, hop_length=hop,
             n_mels=n_mels, f_min=f_min, f_max=f_max, power=2.0)
         if deltas:
             self.delta_op = torchaudio.transforms.ComputeDeltas(win_length=5)
@@ -47,10 +47,10 @@ class MelLinear(nn.Module):
     """Mel power, mean-var normalized (no log)."""
 
     def __init__(self, sample_rate=TARGET_SR, n_fft=N_FFT, hop=HOP, n_mels=40,
-                 f_min=FMIN, f_max=FMAX):
+                 f_min=FMIN, f_max=FMAX, win_length=WIN_LENGTH):
         super().__init__()
         self.mel = torchaudio.transforms.MelSpectrogram(
-            sample_rate=sample_rate, n_fft=n_fft, hop_length=hop,
+            sample_rate=sample_rate, n_fft=n_fft, win_length=win_length, hop_length=hop,
             n_mels=n_mels, f_min=f_min, f_max=f_max, power=2.0)
         self.out_channels = 1
 
@@ -64,10 +64,11 @@ class PCEN(nn.Module):
     """Per-channel energy normalization on the mel spectrogram (Wang et al., 2017)."""
 
     def __init__(self, sample_rate=TARGET_SR, n_fft=N_FFT, hop=HOP, n_mels=40,
-                 f_min=FMIN, f_max=FMAX, alpha=0.98, delta=2.0, r=0.5, s=0.025, eps=1e-6):
+                 f_min=FMIN, f_max=FMAX, win_length=WIN_LENGTH,
+                 alpha=0.98, delta=2.0, r=0.5, s=0.025, eps=1e-6):
         super().__init__()
         self.mel = torchaudio.transforms.MelSpectrogram(
-            sample_rate=sample_rate, n_fft=n_fft, hop_length=hop,
+            sample_rate=sample_rate, n_fft=n_fft, win_length=win_length, hop_length=hop,
             n_mels=n_mels, f_min=f_min, f_max=f_max, power=2.0)
         self.alpha, self.delta, self.r, self.s, self.eps = alpha, delta, r, s, eps
         self.out_channels = 1
@@ -84,15 +85,15 @@ class PCEN(nn.Module):
         return out.unsqueeze(1)
 
 
-def _factory(name, sample_rate, n_fft, hop, f_min, f_max):
+def _factory(name, sample_rate, n_fft, hop, f_min, f_max, win_length):
     builders = {
-        "logmel_40": lambda: LogMel(sample_rate, n_fft, hop, 40, f_min, f_max, deltas=False),
-        "mel_linear": lambda: MelLinear(sample_rate, n_fft, hop, 40, f_min, f_max),
-        "pcen": lambda: PCEN(sample_rate, n_fft, hop, 40, f_min, f_max),
+        "logmel_40": lambda: LogMel(sample_rate, n_fft, hop, 40, f_min, f_max, win_length, deltas=False),
+        "mel_linear": lambda: MelLinear(sample_rate, n_fft, hop, 40, f_min, f_max, win_length),
+        "pcen": lambda: PCEN(sample_rate, n_fft, hop, 40, f_min, f_max, win_length),
         # Incompatible with the unmodified BC-ResNet (see error below):
-        "logmel_30": lambda: LogMel(sample_rate, n_fft, hop, 30, f_min, f_max),
-        "logmel_64": lambda: LogMel(sample_rate, n_fft, hop, 64, f_min, f_max),
-        "logmel_deltas": lambda: LogMel(sample_rate, n_fft, hop, 40, f_min, f_max, deltas=True),
+        "logmel_30": lambda: LogMel(sample_rate, n_fft, hop, 30, f_min, f_max, win_length),
+        "logmel_64": lambda: LogMel(sample_rate, n_fft, hop, 64, f_min, f_max, win_length),
+        "logmel_deltas": lambda: LogMel(sample_rate, n_fft, hop, 40, f_min, f_max, win_length, deltas=True),
     }
     if name not in builders:
         raise ValueError("unknown feature '%s' (choices: %s)" % (name, list(builders)))
@@ -102,9 +103,10 @@ def _factory(name, sample_rate, n_fft, hop, f_min, f_max):
 FEATURE_CHOICES = ("logmel_40", "mel_linear", "pcen")
 
 
-def build_feature(name, sample_rate=TARGET_SR, n_fft=N_FFT, hop=HOP, f_min=FMIN, f_max=FMAX):
+def build_feature(name, sample_rate=TARGET_SR, n_fft=N_FFT, hop=HOP, f_min=FMIN, f_max=FMAX,
+                  win_length=WIN_LENGTH):
     """Build a feature extractor, enforcing BC-ResNet compatibility (40 mels, 1 ch)."""
-    fe = _factory(name, sample_rate, n_fft, hop, f_min, f_max)
+    fe = _factory(name, sample_rate, n_fft, hop, f_min, f_max, win_length)
     n_mels = fe.mel.n_mels if hasattr(fe.mel, "n_mels") else None
     if getattr(fe, "out_channels", 1) != 1:
         raise ValueError(

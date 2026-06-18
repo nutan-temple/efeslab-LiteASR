@@ -17,13 +17,17 @@ from scipy.signal import butter, filtfilt
 
 from .dataset import TARGET_SR
 
-# Mel front-end defaults (used by features.py). Band matches the 50-500 Hz IMU
-# content the data was filtered to, so the 40 mel bins are spent where the signal is.
-FMIN = 50.0
-FMAX = 500.0
+# Mel front-end defaults (used by features.py). Accelerometer/bone-conduction voice
+# pickup has useful content well above 500 Hz but the high end is attenuated/noisy,
+# so default to 40-1000 Hz (sweep f_max up to Nyquist=1666 on the RAW wavs).
+FMIN = 40.0
+FMAX = 1000.0
 N_FFT = 512
-HOP = 64
-HP_CUTOFF = 40.0
+HOP = 64           # ~19 ms @ 3333 Hz (STFT step)
+WIN_LENGTH = 128   # ~38 ms @ 3333 Hz (STFT analysis window; << old implicit 154 ms)
+# High-pass kills the gravity DC (~1 g) and low-frequency body motion (< ~20 Hz)
+# that otherwise dominate accel-Z. Keep it just below FMIN.
+HP_CUTOFF = 25.0
 
 
 def _hp_coeffs(sample_rate, cutoff=HP_CUTOFF, order=4):
