@@ -162,9 +162,13 @@ def _train_core(cfg, device, splits, target_len, sample_rate, on_best=None, verb
         w = tr_counts.sum() / (NUM_CLASSES * np.maximum(tr_counts, 1.0))
         ce_weight = torch.tensor(w, dtype=torch.float32, device=device)
 
-    optimizer = torch.optim.SGD(
-        model.parameters(), lr=0.0, weight_decay=cfg["weight_decay"], momentum=0.9
-    )
+    opt_name = str(cfg.get("optimizer", "sgd")).lower()
+    if opt_name == "adam":
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.0, weight_decay=cfg["weight_decay"])
+    else:
+        optimizer = torch.optim.SGD(
+            model.parameters(), lr=0.0, weight_decay=cfg["weight_decay"], momentum=0.9
+        )
     steps_per_epoch = max(1, len(tr_loader))
     total_iter = steps_per_epoch * cfg["epochs"]
     warmup_iter = steps_per_epoch * cfg["warmup_epochs"]
@@ -178,6 +182,7 @@ def _train_core(cfg, device, splits, target_len, sample_rate, on_best=None, verb
 
     for epoch in range(cfg["epochs"]):
         model.train()
+        run_loss, tr_correct, tr_total = 0.0, 0, 0
         for inputs, lab in tr_loader:
             iteration += 1
             if iteration < warmup_iter:
@@ -197,11 +202,19 @@ def _train_core(cfg, device, splits, target_len, sample_rate, on_best=None, verb
             optimizer.step()
             model.zero_grad()
 
+            bs = lab.size(0)
+            run_loss += float(loss.item()) * bs
+            tr_correct += int((outputs.argmax(-1) == lab).sum().item())
+            tr_total += bs
+
+        train_loss = run_loss / max(1, tr_total)
+        train_acc = 100.0 * tr_correct / max(1, tr_total)
+
         if has_val:
             va_acc, va_f1, _, _ = evaluate(model, va_loader, pre_eval, device)
             if verbose:
-                print("epoch %3d/%d | lr %.4f | val_acc %.2f | val_macroF1 %.4f%s" % (
-                    epoch + 1, cfg["epochs"], lr, va_acc, va_f1,
+                print("epoch %3d/%d | lr %.4f | train_loss %.3f train_acc %.2f | val_acc %.2f val_macroF1 %.4f%s" % (
+                    epoch + 1, cfg["epochs"], lr, train_loss, train_acc, va_acc, va_f1,
                     "  *best*" if va_f1 > best_f1 else ""))
             if va_f1 > best_f1:
                 best_f1 = va_f1
@@ -217,7 +230,8 @@ def _train_core(cfg, device, splits, target_len, sample_rate, on_best=None, verb
                             epoch + 1, cfg["patience"]))
                     break
         elif verbose and (epoch + 1) % 10 == 0:
-            print("epoch %3d/%d | lr %.4f (no val speaker -> full budget)" % (epoch + 1, cfg["epochs"], lr))
+            print("epoch %3d/%d | lr %.4f | train_loss %.3f train_acc %.2f (no val speaker)" % (
+                epoch + 1, cfg["epochs"], lr, train_loss, train_acc))
 
     if not has_val:
         # No validation split: keep the final-epoch weights.

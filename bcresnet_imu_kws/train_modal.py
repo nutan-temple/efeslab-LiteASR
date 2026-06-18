@@ -69,6 +69,7 @@ def train_remote(
     test_frac: float = 0.10,
     val_frac: float = 0.10,
     loso: bool = True,
+    optimizer: str = "sgd",
 ):
     import sys
 
@@ -102,6 +103,7 @@ def train_remote(
         strict_sr=strict_sr,
         test_frac=test_frac,
         val_frac=val_frac,
+        optimizer=optimizer,
         num_workers=4,
     )
 
@@ -208,6 +210,9 @@ def main(
     tau: float = 3.0,
     epochs: int = 120,
     batch_size: int = 32,
+    lr: float = 0.05,
+    optimizer: str = "sgd",
+    length_percentile: float = 99.0,
     use_filtered: bool = True,
     manifest: str = "",
     balanced_sampler: bool = False,
@@ -218,6 +223,9 @@ def main(
         tau=tau,
         epochs=epochs,
         batch_size=batch_size,
+        lr=lr,
+        optimizer=optimizer,
+        length_percentile=length_percentile,
         use_filtered=use_filtered,
         manifest=(manifest or None),
         balanced_sampler=balanced_sampler,
