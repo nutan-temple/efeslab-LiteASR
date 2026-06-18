@@ -31,7 +31,12 @@ Classes: `begin_activity`, `stop_activity`, `wake_up`, `end`, `emergency`.
   (gain / time-shift / gaussian noise) is done in our own dataset.
 
 ### Accuracy-oriented choices (not brute force)
-- Stratified 70/15/15 split.
+- **Speaker-disjoint 80/10/10 split**: every speaker (the top-level folder, e.g.
+  `arnav/`) lands entirely in one split, so no speaker appears in train *and*
+  val/test (prevents speaker leakage / inflated scores).
+- The **test set is class-balanced to the train distribution**: a fast randomized
+  search over speaker->split assignments picks the one whose test per-class
+  proportions best match the train split (while keeping all classes in train).
 - Class-weighted cross-entropy (default) or an optional balanced sampler to handle
   the imbalance (`begin_activity=213 ... emergency=73`).
 - Cosine LR schedule with warmup (same shape as the original `main.py`).

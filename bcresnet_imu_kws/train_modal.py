@@ -66,6 +66,8 @@ def train_remote(
     target_len: int = 0,
     target_sr: int = 3333,
     strict_sr: bool = False,
+    test_frac: float = 0.10,
+    val_frac: float = 0.10,
 ):
     import sys
 
@@ -97,6 +99,8 @@ def train_remote(
         target_len=(target_len or None),
         target_sr=target_sr,
         strict_sr=strict_sr,
+        test_frac=test_frac,
+        val_frac=val_frac,
         num_workers=4,
     )
 

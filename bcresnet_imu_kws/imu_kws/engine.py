@@ -25,11 +25,11 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from sklearn.metrics import classification_report, confusion_matrix, f1_score
-from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader, WeightedRandomSampler
 
 from .dataset import IMUKeywordDataset, build_index, compute_fixed_len, TARGET_SR
 from .labels import CLASSES, NUM_CLASSES
+from .splits import make_speaker_disjoint_splits
 
 # --- import the UNMODIFIED Qualcomm BC-ResNet code from the vendored copy ------
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -81,21 +81,6 @@ def build_preprocessors(device, tau, sample_rate=TARGET_SR):
     )
     pre_eval = Preprocess(None, device, specaug=False, **mel_kwargs)
     return pre_train, pre_eval
-
-
-def make_splits(paths, labels, seed):
-    """Stratified 70/15/15 split. Returns dict of (paths, labels) per split."""
-    p_tr, p_tmp, y_tr, y_tmp = train_test_split(
-        paths, labels, test_size=0.30, random_state=seed, stratify=labels
-    )
-    p_va, p_te, y_va, y_te = train_test_split(
-        p_tmp, y_tmp, test_size=0.50, random_state=seed, stratify=y_tmp
-    )
-    return {
-        "train": (p_tr, y_tr),
-        "valid": (p_va, y_va),
-        "test": (p_te, y_te),
-    }
 
 
 def _make_loaders(splits, target_len, batch_size, balanced_sampler, num_workers, target_sr=TARGET_SR):
@@ -178,7 +163,10 @@ def train(cfg, device, on_best=None):
     print("fixed input length: %d samples (~%.2fs @ %d Hz)" % (
         target_len, target_len / float(sample_rate), sample_rate))
 
-    splits = make_splits(paths, labels, cfg["seed"])
+    splits = make_speaker_disjoint_splits(
+        paths, labels, cfg["wav_dir"], seed=cfg["seed"],
+        test_frac=cfg.get("test_frac", 0.10), val_frac=cfg.get("val_frac", 0.10),
+    )
     for name in ("train", "valid", "test"):
         _, ys = splits[name]
         print("  %-5s: %d" % (name, len(ys)))
