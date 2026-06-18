@@ -29,7 +29,11 @@ from torch.utils.data import DataLoader, WeightedRandomSampler
 
 from .dataset import IMUKeywordDataset, build_index, compute_fixed_len, TARGET_SR
 from .labels import CLASSES, NUM_CLASSES
-from .splits import make_speaker_disjoint_splits
+from .splits import (
+    assign_by_speaker,
+    leave_one_speaker_out_plan,
+    make_speaker_disjoint_splits,
+)
 
 # --- import the UNMODIFIED Qualcomm BC-ResNet code from the vendored copy ------
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -130,60 +134,26 @@ def evaluate(model, loader, preprocess, device):
     return acc, macro_f1, y_true, y_pred
 
 
-def train(cfg, device, on_best=None):
-    """Run the full pipeline and return a results dict.
+def _train_core(cfg, device, splits, target_len, sample_rate, on_best=None, verbose=True):
+    """Train one model on the given ``splits`` and evaluate on its test set.
 
-    ``cfg`` keys: wav_dir, use_filtered, manifest, tau, epochs, batch_size, lr,
-    weight_decay, warmup_epochs, patience, seed, length_percentile, target_len,
-    balanced_sampler, num_workers.
-    ``on_best(state_dict, epoch, val_macro_f1)`` is called whenever validation
-    macro-F1 improves (used to checkpoint + commit the Modal volume).
+    Returns a results dict including the pooled ``y_true``/``y_pred`` for the test
+    split so callers (e.g. LOSO) can aggregate across folds.
     """
-    set_seed(cfg["seed"])
-
-    sample_rate = int(cfg.get("target_sr", TARGET_SR))
-    strict_sr = bool(cfg.get("strict_sr", False))
-
-    paths, labels, skipped = build_index(
-        cfg["wav_dir"], cfg["use_filtered"], cfg.get("manifest"),
-        target_sr=sample_rate, strict_sr=strict_sr,
-    )
-    if len(paths) == 0:
-        raise RuntimeError("No usable wav files found under %s" % cfg["wav_dir"])
-
-    counts = np.bincount(labels, minlength=NUM_CLASSES)
-    print("usable files: %d | per-class: %s" % (
-        len(paths), {CLASSES[i]: int(counts[i]) for i in range(NUM_CLASSES)}))
-    print("training rate locked to %d Hz (strict_sr=%s)" % (sample_rate, strict_sr))
-    if skipped:
-        print("skipped %d files (e.g. %s)" % (len(skipped), skipped[:3]))
-
-    target_len = cfg.get("target_len") or compute_fixed_len(
-        paths, cfg["length_percentile"], target_sr=sample_rate)
-    print("fixed input length: %d samples (~%.2fs @ %d Hz)" % (
-        target_len, target_len / float(sample_rate), sample_rate))
-
-    splits = make_speaker_disjoint_splits(
-        paths, labels, cfg["wav_dir"], seed=cfg["seed"],
-        test_frac=cfg.get("test_frac", 0.10), val_frac=cfg.get("val_frac", 0.10),
-    )
-    for name in ("train", "valid", "test"):
-        _, ys = splits[name]
-        print("  %-5s: %d" % (name, len(ys)))
-
     (_, _, _), (tr_loader, va_loader, te_loader) = _make_loaders(
         splits, target_len, cfg["batch_size"], cfg["balanced_sampler"],
         cfg.get("num_workers", 4), target_sr=sample_rate,
     )
+    has_val = len(splits["valid"][1]) > 0
 
     model = BCResNets(int(cfg["tau"] * 8), num_classes=NUM_CLASSES).to(device)
     n_params = sum(p.numel() for p in model.parameters())
-    print("model: BC-ResNet-%.1f | params: %d (~%.1f KB fp32)" % (
-        cfg["tau"], n_params, n_params * 4 / 1024.0))
+    if verbose:
+        print("model: BC-ResNet-%.1f | params: %d (~%.1f KB fp32)" % (
+            cfg["tau"], n_params, n_params * 4 / 1024.0))
 
     pre_train, pre_eval = build_preprocessors(device, cfg["tau"], sample_rate=sample_rate)
 
-    # class-weighted CE (skip weights if the balanced sampler already rebalances)
     if cfg["balanced_sampler"]:
         ce_weight = None
     else:
@@ -191,7 +161,6 @@ def train(cfg, device, on_best=None):
         tr_counts = np.bincount(y_tr, minlength=NUM_CLASSES).astype(np.float64)
         w = tr_counts.sum() / (NUM_CLASSES * np.maximum(tr_counts, 1.0))
         ce_weight = torch.tensor(w, dtype=torch.float32, device=device)
-        print("class weights: %s" % {CLASSES[i]: round(float(w[i]), 3) for i in range(NUM_CLASSES)})
 
     optimizer = torch.optim.SGD(
         model.parameters(), lr=0.0, weight_decay=cfg["weight_decay"], momentum=0.9
@@ -205,6 +174,7 @@ def train(cfg, device, on_best=None):
     best_state = None
     bad_epochs = 0
     iteration = 0
+    lr = init_lr
 
     for epoch in range(cfg["epochs"]):
         model.train()
@@ -227,23 +197,33 @@ def train(cfg, device, on_best=None):
             optimizer.step()
             model.zero_grad()
 
-        va_acc, va_f1, _, _ = evaluate(model, va_loader, pre_eval, device)
-        print("epoch %3d/%d | lr %.4f | val_acc %.2f | val_macroF1 %.4f%s" % (
-            epoch + 1, cfg["epochs"], lr, va_acc, va_f1,
-            "  *best*" if va_f1 > best_f1 else ""))
+        if has_val:
+            va_acc, va_f1, _, _ = evaluate(model, va_loader, pre_eval, device)
+            if verbose:
+                print("epoch %3d/%d | lr %.4f | val_acc %.2f | val_macroF1 %.4f%s" % (
+                    epoch + 1, cfg["epochs"], lr, va_acc, va_f1,
+                    "  *best*" if va_f1 > best_f1 else ""))
+            if va_f1 > best_f1:
+                best_f1 = va_f1
+                bad_epochs = 0
+                best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+                if on_best is not None:
+                    on_best(best_state, epoch, best_f1)
+            else:
+                bad_epochs += 1
+                if cfg["patience"] and bad_epochs >= cfg["patience"]:
+                    if verbose:
+                        print("early stopping at epoch %d (no val improvement for %d)" % (
+                            epoch + 1, cfg["patience"]))
+                    break
+        elif verbose and (epoch + 1) % 10 == 0:
+            print("epoch %3d/%d | lr %.4f (no val speaker -> full budget)" % (epoch + 1, cfg["epochs"], lr))
 
-        if va_f1 > best_f1:
-            best_f1 = va_f1
-            bad_epochs = 0
-            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-            if on_best is not None:
-                on_best(best_state, epoch, best_f1)
-        else:
-            bad_epochs += 1
-            if cfg["patience"] and bad_epochs >= cfg["patience"]:
-                print("early stopping at epoch %d (no val improvement for %d epochs)" % (
-                    epoch + 1, cfg["patience"]))
-                break
+    if not has_val:
+        # No validation split: keep the final-epoch weights.
+        best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+        if on_best is not None:
+            on_best(best_state, cfg["epochs"] - 1, float("nan"))
 
     if best_state is not None:
         model.load_state_dict(best_state)
@@ -252,9 +232,6 @@ def train(cfg, device, on_best=None):
     report = classification_report(y_true, y_pred, labels=list(range(NUM_CLASSES)),
                                    target_names=CLASSES, digits=4, zero_division=0)
     cm = confusion_matrix(y_true, y_pred, labels=list(range(NUM_CLASSES))).tolist()
-    print("\n=== TEST ===\nacc %.2f | macroF1 %.4f\n%s\nconfusion_matrix=%s" % (
-        te_acc, te_f1, report, cm))
-
     return {
         "model": model,
         "best_state": best_state,
@@ -263,8 +240,131 @@ def train(cfg, device, on_best=None):
         "test_macro_f1": te_f1,
         "report": report,
         "confusion_matrix": cm,
-        "target_len": int(target_len),
+        "y_true": y_true,
+        "y_pred": y_pred,
         "n_params": int(n_params),
-        "skipped": skipped,
         "classes": CLASSES,
+    }
+
+
+def _prepare(cfg):
+    """Shared setup: index the data, log stats, return (paths, labels, skipped,
+    target_len, sample_rate)."""
+    set_seed(cfg["seed"])
+    sample_rate = int(cfg.get("target_sr", TARGET_SR))
+    strict_sr = bool(cfg.get("strict_sr", False))
+
+    paths, labels, skipped = build_index(
+        cfg["wav_dir"], cfg["use_filtered"], cfg.get("manifest"),
+        target_sr=sample_rate, strict_sr=strict_sr,
+    )
+    if len(paths) == 0:
+        raise RuntimeError("No usable wav files found under %s" % cfg["wav_dir"])
+
+    counts = np.bincount(labels, minlength=NUM_CLASSES)
+    print("usable files: %d | per-class: %s" % (
+        len(paths), {CLASSES[i]: int(counts[i]) for i in range(NUM_CLASSES)}))
+    print("training rate locked to %d Hz (strict_sr=%s)" % (sample_rate, strict_sr))
+    if skipped:
+        print("skipped %d files (e.g. %s)" % (len(skipped), skipped[:3]))
+
+    target_len = cfg.get("target_len") or compute_fixed_len(
+        paths, cfg["length_percentile"], target_sr=sample_rate)
+    print("fixed input length: %d samples (~%.2fs @ %d Hz)" % (
+        target_len, target_len / float(sample_rate), sample_rate))
+    return paths, labels, skipped, target_len, sample_rate
+
+
+def train(cfg, device, on_best=None):
+    """Single speaker-disjoint 80/10/10 split, train once, test once."""
+    paths, labels, skipped, target_len, sample_rate = _prepare(cfg)
+
+    splits = make_speaker_disjoint_splits(
+        paths, labels, cfg["wav_dir"], seed=cfg["seed"],
+        test_frac=cfg.get("test_frac", 0.10), val_frac=cfg.get("val_frac", 0.10),
+    )
+    for name in ("train", "valid", "test"):
+        print("  %-5s: %d" % (name, len(splits[name][1])))
+
+    res = _train_core(cfg, device, splits, target_len, sample_rate, on_best=on_best, verbose=True)
+    res.update({"target_len": int(target_len), "skipped": skipped})
+    print("\n=== TEST ===\nacc %.2f | macroF1 %.4f\n%s\nconfusion_matrix=%s" % (
+        res["test_acc"], res["test_macro_f1"], res["report"], res["confusion_matrix"]))
+    return res
+
+
+def run_loso(cfg, device, on_fold=None):
+    """Leave-One-Speaker-Out cross-validation.
+
+    Trains one model per held-out test speaker and aggregates results. ``on_fold``,
+    if given, is called as ``on_fold(test_speaker, state_dict, epoch, val_f1)`` on
+    each fold's best checkpoint (used to save + commit per-fold models on Modal).
+    """
+    paths, labels, skipped, target_len, sample_rate = _prepare(cfg)
+
+    folds, speakers = leave_one_speaker_out_plan(paths, labels, cfg["wav_dir"])
+    print("LOSO: %d folds over %d speakers: %s" % (len(folds), len(speakers), speakers))
+
+    pooled_true, pooled_pred, per_fold = [], [], []
+    last_n_params = None
+    for fi, fold in enumerate(folds):
+        test_spk, val_spk = fold["test"], fold["val"]
+        print("\n===== FOLD %d/%d | test=%s | val=%s =====" % (
+            fi + 1, len(folds), test_spk, val_spk))
+        splits = assign_by_speaker(
+            paths, labels, cfg["wav_dir"], [test_spk], [val_spk] if val_spk else [])
+        for name in ("train", "valid", "test"):
+            print("  %-5s: %d" % (name, len(splits[name][1])))
+
+        fold_on_best = None
+        if on_fold is not None:
+            def fold_on_best(state, epoch, f1, _ts=test_spk):
+                on_fold(_ts, state, epoch, f1)
+
+        res = _train_core(cfg, device, splits, target_len, sample_rate,
+                          on_best=fold_on_best, verbose=True)
+        last_n_params = res["n_params"]
+        pooled_true.append(res["y_true"])
+        pooled_pred.append(res["y_pred"])
+        per_fold.append({
+            "test_speaker": test_spk, "val_speaker": val_spk,
+            "n_test": int(len(res["y_true"])),
+            "test_acc": res["test_acc"], "test_macro_f1": res["test_macro_f1"],
+        })
+        print("fold %s -> test_acc %.2f | macroF1 %.4f" % (
+            test_spk, res["test_acc"], res["test_macro_f1"]))
+
+    y_true = np.concatenate(pooled_true)
+    y_pred = np.concatenate(pooled_pred)
+    pooled_acc = float((y_true == y_pred).mean() * 100.0)
+    pooled_f1 = float(f1_score(y_true, y_pred, average="macro", zero_division=0))
+    report = classification_report(y_true, y_pred, labels=list(range(NUM_CLASSES)),
+                                   target_names=CLASSES, digits=4, zero_division=0)
+    cm = confusion_matrix(y_true, y_pred, labels=list(range(NUM_CLASSES))).tolist()
+    accs = [f["test_acc"] for f in per_fold]
+    f1s = [f["test_macro_f1"] for f in per_fold]
+
+    print("\n===== LOSO SUMMARY =====")
+    print("per-fold macroF1 %.4f +/- %.4f | per-fold acc %.2f +/- %.2f" % (
+        float(np.mean(f1s)), float(np.std(f1s)), float(np.mean(accs)), float(np.std(accs))))
+    print("pooled (all held-out speakers) acc %.2f | macroF1 %.4f" % (pooled_acc, pooled_f1))
+    print(report)
+    print("pooled confusion_matrix=%s" % cm)
+
+    return {
+        "mode": "loso",
+        "folds": per_fold,
+        "pooled_acc": pooled_acc,
+        "pooled_macro_f1": pooled_f1,
+        "fold_macro_f1_mean": float(np.mean(f1s)),
+        "fold_macro_f1_std": float(np.std(f1s)),
+        "fold_acc_mean": float(np.mean(accs)),
+        "fold_acc_std": float(np.std(accs)),
+        "report": report,
+        "confusion_matrix": cm,
+        "target_len": int(target_len),
+        "n_params": last_n_params,
+        "classes": CLASSES,
+        "skipped": skipped,
+        "speakers": speakers,
     }

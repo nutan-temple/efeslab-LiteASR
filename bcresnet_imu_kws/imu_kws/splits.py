@@ -47,6 +47,57 @@ def _pack(paths, labels, tr_idx, va_idx, te_idx):
     return {"train": take(tr_idx), "valid": take(va_idx), "test": take(te_idx)}
 
 
+def speaker_groups(paths, wav_dir):
+    """Map speaker id -> list of sample indices."""
+    groups = defaultdict(list)
+    for i, p in enumerate(paths):
+        groups[speaker_from_path(p, wav_dir)].append(i)
+    return groups
+
+
+def assign_by_speaker(paths, labels, wav_dir, test_speakers, val_speakers=None):
+    """Build a splits dict by assigning whole speakers to test / val / (rest=train)."""
+    test_set = set(test_speakers)
+    val_set = set(val_speakers or [])
+    groups = speaker_groups(paths, wav_dir)
+    tr_idx, va_idx, te_idx = [], [], []
+    for spk, idxs in groups.items():
+        if spk in test_set:
+            te_idx += idxs
+        elif spk in val_set:
+            va_idx += idxs
+        else:
+            tr_idx += idxs
+    return _pack(paths, labels, tr_idx, va_idx, te_idx)
+
+
+def leave_one_speaker_out_plan(paths, labels, wav_dir):
+    """Return ``(folds, speakers)`` for Leave-One-Speaker-Out cross-validation.
+
+    Each fold holds one speaker out as the test set. A second, *representative*
+    speaker (class-distribution closest to the global distribution) is held out as
+    validation for early stopping, so test/val/train are all speaker-disjoint. With
+    fewer than 3 speakers there is no room for a separate val speaker, so ``val`` is
+    ``None`` (training then runs for the full epoch budget with no early stopping).
+    """
+    groups = speaker_groups(paths, wav_dir)
+    speakers = sorted(groups)
+    global_dist = _class_dist(np.array(labels))
+
+    def dist_l1(spk):
+        d = _class_dist(np.array([labels[i] for i in groups[spk]]))
+        return float(np.abs(d - global_dist).sum())
+
+    folds = []
+    for test_spk in speakers:
+        remaining = [s for s in speakers if s != test_spk]
+        val_spk = None
+        if len(speakers) >= 3 and remaining:
+            val_spk = min(remaining, key=lambda s: (dist_l1(s), s))
+        folds.append({"test": test_spk, "val": val_spk})
+    return folds, speakers
+
+
 def _stratified_fallback(paths, labels, seed, test_frac, val_frac, reason):
     from sklearn.model_selection import train_test_split
 

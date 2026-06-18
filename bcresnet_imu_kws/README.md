@@ -31,12 +31,14 @@ Classes: `begin_activity`, `stop_activity`, `wake_up`, `end`, `emergency`.
   (gain / time-shift / gaussian noise) is done in our own dataset.
 
 ### Accuracy-oriented choices (not brute force)
-- **Speaker-disjoint 80/10/10 split**: every speaker (the top-level folder, e.g.
-  `arnav/`) lands entirely in one split, so no speaker appears in train *and*
-  val/test (prevents speaker leakage / inflated scores).
-- The **test set is class-balanced to the train distribution**: a fast randomized
-  search over speaker->split assignments picks the one whose test per-class
-  proportions best match the train split (while keeping all classes in train).
+- **Evaluation defaults to Leave-One-Speaker-Out (LOSO) cross-validation**: each
+  speaker is held out as the test set in turn, the model is trained on the others,
+  and results are pooled across all folds (so every recording is tested exactly
+  once, on a speaker the model never trained on). A second *representative* speaker
+  is held out per fold for validation/early-stopping, so train/val/test stay
+  speaker-disjoint. Reported as per-fold mean +/- std and a pooled confusion matrix.
+- A single **speaker-disjoint 80/10/10 split** is still available with `--loso False`
+  (test set class-balanced to the train distribution via a randomized speaker search).
 - Class-weighted cross-entropy (default) or an optional balanced sampler to handle
   the imbalance (`begin_activity=213 ... emergency=73`).
 - Cosine LR schedule with warmup (same shape as the original `main.py`).
@@ -73,6 +75,10 @@ modal run bcresnet_imu_kws/inspect_data_modal.py
 # 2) train (writes to the kws-imu-models volume, commits on every best epoch)
 modal run bcresnet_imu_kws/train_modal.py --tau 3 --epochs 120
 
+# default is Leave-One-Speaker-Out CV (one model per held-out speaker).
+# to use a single speaker-disjoint 80/10/10 split instead:
+modal run bcresnet_imu_kws/train_modal.py --tau 3 --loso False
+
 # smaller / edge-tiny model:
 modal run bcresnet_imu_kws/train_modal.py --tau 1 --epochs 150
 
@@ -80,13 +86,15 @@ modal run bcresnet_imu_kws/train_modal.py --tau 1 --epochs 150
 modal run bcresnet_imu_kws/train_modal.py --strict-sr
 ```
 
-Outputs land in the `kws-imu-models` volume at `/models/bcresnet_imu/`:
-`bcresnet_imu_best.pt` (state dict + class list + mel config) and `summary.json`
-(test accuracy, macro-F1, per-class report, confusion matrix).
+Outputs land in the `kws-imu-models` volume at `/models/bcresnet_imu/`. LOSO writes
+one checkpoint per held-out speaker (`bcresnet_imu_fold_<speaker>.pt`) plus
+`loso_summary.json` (per-fold metrics, pooled accuracy/macro-F1, pooled confusion
+matrix). The single-split mode writes `bcresnet_imu_best.pt` + `summary.json`.
 
 Download them locally with:
 
 ```bash
+modal volume get kws-imu-models bcresnet_imu/loso_summary.json
 modal volume get kws-imu-models bcresnet_imu/summary.json
 modal volume get kws-imu-models bcresnet_imu/bcresnet_imu_best.pt
 ```
