@@ -64,6 +64,8 @@ def train_remote(
     length_percentile: float = 99.0,
     balanced_sampler: bool = False,
     target_len: int = 0,
+    target_sr: int = 3333,
+    strict_sr: bool = False,
 ):
     import sys
 
@@ -93,6 +95,8 @@ def train_remote(
         length_percentile=length_percentile,
         balanced_sampler=balanced_sampler,
         target_len=(target_len or None),
+        target_sr=target_sr,
+        strict_sr=strict_sr,
         num_workers=4,
     )
 
@@ -104,7 +108,7 @@ def train_remote(
                 "tau": tau,
                 "epoch": epoch + 1,
                 "val_macro_f1": val_f1,
-                "mel": dict(sample_rate=3333, n_fft=512, win_length=256, hop_length=64, n_mels=40),
+                "mel": dict(sample_rate=target_sr, n_fft=512, win_length=256, hop_length=64, n_mels=40),
             },
             ckpt_path,
         )
@@ -121,7 +125,7 @@ def train_remote(
             "tau": tau,
             "val_macro_f1": result["best_val_macro_f1"],
             "target_len": result["target_len"],
-            "mel": dict(sample_rate=3333, n_fft=512, win_length=256, hop_length=64, n_mels=40),
+            "mel": dict(sample_rate=target_sr, n_fft=512, win_length=256, hop_length=64, n_mels=40),
         },
         ckpt_path,
     )
@@ -153,6 +157,7 @@ def main(
     use_filtered: bool = True,
     manifest: str = "",
     balanced_sampler: bool = False,
+    strict_sr: bool = False,
 ):
     summary = train_remote.remote(
         tau=tau,
@@ -161,6 +166,7 @@ def main(
         use_filtered=use_filtered,
         manifest=(manifest or None),
         balanced_sampler=balanced_sampler,
+        strict_sr=strict_sr,
     )
     print(json.dumps(
         {k: summary[k] for k in ("best_val_macro_f1", "test_acc", "test_macro_f1", "target_len")},

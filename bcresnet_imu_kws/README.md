@@ -21,6 +21,10 @@ Classes: `begin_activity`, `stop_activity`, `wake_up`, `end`, `emergency`.
   kernel, so the frequency axis must reduce `40 -> 20 -> 10 -> 5 -> 1`).
 - The mel front-end is retuned for 3333 Hz audio: `n_fft=512`, `win_length=256`
   (~77 ms), `hop_length=64` (~19 ms).
+- **Training rate is locked to 3.3 kHz only.** `TARGET_SR = 3333` is the single
+  source of truth (`imu_kws/dataset.py`). On load, anything not at 3.3 kHz is
+  resampled to 3.3 kHz; with `--strict-sr` it is instead skipped. The model never
+  sees any other sample rate.
 - Their waveform noise-augmentation path is GSC/16 kHz-specific and needs
   background-noise wavs, so we call `Preprocess(..., augment=False)` — only the
   (sample-rate-correct) LogMel + SpecAugment run. Light waveform augmentation
@@ -66,6 +70,9 @@ modal run bcresnet_imu_kws/train_modal.py --tau 3 --epochs 120
 
 # smaller / edge-tiny model:
 modal run bcresnet_imu_kws/train_modal.py --tau 1 --epochs 150
+
+# strict 3.3 kHz only: skip (don't resample) any file not stored at 3333 Hz
+modal run bcresnet_imu_kws/train_modal.py --strict-sr
 ```
 
 Outputs land in the `kws-imu-models` volume at `/models/bcresnet_imu/`:

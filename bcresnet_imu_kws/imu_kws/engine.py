@@ -28,7 +28,7 @@ from sklearn.metrics import classification_report, confusion_matrix, f1_score
 from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader, WeightedRandomSampler
 
-from .dataset import IMUKeywordDataset, build_index, compute_fixed_len
+from .dataset import IMUKeywordDataset, build_index, compute_fixed_len, TARGET_SR
 from .labels import CLASSES, NUM_CLASSES
 
 # --- import the UNMODIFIED Qualcomm BC-ResNet code from the vendored copy ------
@@ -54,7 +54,7 @@ def set_seed(seed=42):
         torch.cuda.manual_seed_all(seed)
 
 
-def build_preprocessors(device, tau, sample_rate=3333):
+def build_preprocessors(device, tau, sample_rate=TARGET_SR):
     """Two vendored ``Preprocess`` instances: train (SpecAugment) and eval (clean).
 
     We pass ``noise_loc=None`` and always call them with ``augment=False`` so the
@@ -98,14 +98,14 @@ def make_splits(paths, labels, seed):
     }
 
 
-def _make_loaders(splits, target_len, batch_size, balanced_sampler, num_workers):
+def _make_loaders(splits, target_len, batch_size, balanced_sampler, num_workers, target_sr=TARGET_SR):
     p_tr, y_tr = splits["train"]
     p_va, y_va = splits["valid"]
     p_te, y_te = splits["test"]
 
-    ds_tr = IMUKeywordDataset(p_tr, y_tr, target_len, train=True, augment=True)
-    ds_va = IMUKeywordDataset(p_va, y_va, target_len, train=False, augment=False)
-    ds_te = IMUKeywordDataset(p_te, y_te, target_len, train=False, augment=False)
+    ds_tr = IMUKeywordDataset(p_tr, y_tr, target_len, train=True, augment=True, target_sr=target_sr)
+    ds_va = IMUKeywordDataset(p_va, y_va, target_len, train=False, augment=False, target_sr=target_sr)
+    ds_te = IMUKeywordDataset(p_te, y_te, target_len, train=False, augment=False, target_sr=target_sr)
 
     if balanced_sampler:
         counts = np.bincount(y_tr, minlength=NUM_CLASSES).astype(np.float64)
@@ -156,18 +156,27 @@ def train(cfg, device, on_best=None):
     """
     set_seed(cfg["seed"])
 
-    paths, labels, skipped = build_index(cfg["wav_dir"], cfg["use_filtered"], cfg.get("manifest"))
+    sample_rate = int(cfg.get("target_sr", TARGET_SR))
+    strict_sr = bool(cfg.get("strict_sr", False))
+
+    paths, labels, skipped = build_index(
+        cfg["wav_dir"], cfg["use_filtered"], cfg.get("manifest"),
+        target_sr=sample_rate, strict_sr=strict_sr,
+    )
     if len(paths) == 0:
         raise RuntimeError("No usable wav files found under %s" % cfg["wav_dir"])
 
     counts = np.bincount(labels, minlength=NUM_CLASSES)
     print("usable files: %d | per-class: %s" % (
         len(paths), {CLASSES[i]: int(counts[i]) for i in range(NUM_CLASSES)}))
+    print("training rate locked to %d Hz (strict_sr=%s)" % (sample_rate, strict_sr))
     if skipped:
         print("skipped %d files (e.g. %s)" % (len(skipped), skipped[:3]))
 
-    target_len = cfg.get("target_len") or compute_fixed_len(paths, cfg["length_percentile"])
-    print("fixed input length: %d samples (~%.2fs @ 3333 Hz)" % (target_len, target_len / 3333.0))
+    target_len = cfg.get("target_len") or compute_fixed_len(
+        paths, cfg["length_percentile"], target_sr=sample_rate)
+    print("fixed input length: %d samples (~%.2fs @ %d Hz)" % (
+        target_len, target_len / float(sample_rate), sample_rate))
 
     splits = make_splits(paths, labels, cfg["seed"])
     for name in ("train", "valid", "test"):
@@ -175,7 +184,8 @@ def train(cfg, device, on_best=None):
         print("  %-5s: %d" % (name, len(ys)))
 
     (_, _, _), (tr_loader, va_loader, te_loader) = _make_loaders(
-        splits, target_len, cfg["batch_size"], cfg["balanced_sampler"], cfg.get("num_workers", 4)
+        splits, target_len, cfg["batch_size"], cfg["balanced_sampler"],
+        cfg.get("num_workers", 4), target_sr=sample_rate,
     )
 
     model = BCResNets(int(cfg["tau"] * 8), num_classes=NUM_CLASSES).to(device)
@@ -183,7 +193,7 @@ def train(cfg, device, on_best=None):
     print("model: BC-ResNet-%.1f | params: %d (~%.1f KB fp32)" % (
         cfg["tau"], n_params, n_params * 4 / 1024.0))
 
-    pre_train, pre_eval = build_preprocessors(device, cfg["tau"])
+    pre_train, pre_eval = build_preprocessors(device, cfg["tau"], sample_rate=sample_rate)
 
     # class-weighted CE (skip weights if the balanced sampler already rebalances)
     if cfg["balanced_sampler"]:

@@ -18,6 +18,11 @@ from .labels import filename_to_label
 
 FILTERED_SUFFIX = "_50_500hz.wav"
 
+# Single source of truth: this pipeline trains on 3.3 kHz audio ONLY.
+# Any file that is not at this rate is resampled to it on load (or skipped in
+# strict mode). The mel front-end in engine.py is tuned for exactly this rate.
+TARGET_SR = 3333
+
 
 def list_wav_files(wav_dir, use_filtered=True, manifest=None):
     """Collect the wav paths we want to train on.
@@ -51,11 +56,13 @@ def list_wav_files(wav_dir, use_filtered=True, manifest=None):
     return sorted(set(files))
 
 
-def build_index(wav_dir, use_filtered=True, manifest=None):
+def build_index(wav_dir, use_filtered=True, manifest=None, target_sr=TARGET_SR, strict_sr=False):
     """Return ``(paths, labels, skipped)`` keeping only readable, labeled files.
 
     Gracefully drops the stray malformed file and anything that fails to parse
-    to a known class or fails to open.
+    to a known class or fails to open. When ``strict_sr`` is True, files whose
+    native sample rate differs from ``target_sr`` (3.3 kHz) are also skipped;
+    otherwise they are kept and resampled to ``target_sr`` at load time.
     """
     paths, labels, skipped = [], [], []
     for p in list_wav_files(wav_dir, use_filtered, manifest):
@@ -74,22 +81,30 @@ def build_index(wav_dir, use_filtered=True, manifest=None):
         except Exception as exc:  # malformed / unreadable wav
             skipped.append((p, "unreadable: %s" % exc))
             continue
+        if strict_sr and info.sample_rate != target_sr:
+            skipped.append((p, "sample_rate=%d!=%d" % (info.sample_rate, target_sr)))
+            continue
         paths.append(p)
         labels.append(lab)
     return paths, labels, skipped
 
 
-def compute_fixed_len(paths, percentile=99.0):
-    """Pick a single fixed input length (in samples) from the data itself.
+def compute_fixed_len(paths, percentile=99.0, target_sr=TARGET_SR):
+    """Pick a single fixed input length (in samples at ``target_sr``) from the data.
 
     Using a high percentile (default 99th) avoids guessing a duration and only
     crops a handful of unusually long outliers, while everything shorter is
-    zero-padded. This is data-driven rather than brute-forced.
+    zero-padded. Lengths are scaled to ``target_sr`` so the value is correct even
+    if a clip was stored at a different native rate (and thus gets resampled).
     """
     lengths = []
     for p in paths:
         try:
-            lengths.append(torchaudio.info(p).num_frames)
+            info = torchaudio.info(p)
+            n = info.num_frames
+            if info.sample_rate != target_sr:
+                n = int(round(n * target_sr / float(info.sample_rate)))
+            lengths.append(n)
         except Exception:
             pass
     if not lengths:
@@ -97,16 +112,22 @@ def compute_fixed_len(paths, percentile=99.0):
     return int(np.percentile(np.asarray(lengths, dtype=np.float64), percentile))
 
 
-def load_wav_mono(path, normalize=True):
-    """Load a wav as a mono ``[1, L]`` float tensor, optionally peak-normalized."""
+def load_wav_mono(path, target_sr=TARGET_SR, normalize=True):
+    """Load a wav as a mono ``[1, L]`` float tensor at ``target_sr`` (3.3 kHz).
+
+    Resamples to ``target_sr`` when the file was stored at a different rate so the
+    model only ever sees 3.3 kHz audio.
+    """
     wav, sr = torchaudio.load(path)  # [C, L]
     if wav.shape[0] > 1:
         wav = wav.mean(dim=0, keepdim=True)
+    if sr != target_sr:
+        wav = torchaudio.functional.resample(wav, orig_freq=sr, new_freq=target_sr)
     if normalize:
         peak = wav.abs().max()
         if peak > 0:
             wav = wav / (peak + 1e-8)
-    return wav, sr
+    return wav, target_sr
 
 
 def fix_length(wav, target_len, train=False):
@@ -139,6 +160,7 @@ class IMUKeywordDataset(Dataset):
         train=False,
         augment=False,
         normalize=True,
+        target_sr=TARGET_SR,
         noise_std=0.005,
         gain_db=3.0,
         shift_frac=0.1,
@@ -149,6 +171,7 @@ class IMUKeywordDataset(Dataset):
         self.train = train
         self.augment = bool(augment and train)
         self.normalize = normalize
+        self.target_sr = int(target_sr)
         self.noise_std = noise_std
         self.gain_db = gain_db
         self.shift_frac = shift_frac
@@ -170,7 +193,7 @@ class IMUKeywordDataset(Dataset):
         return wav
 
     def __getitem__(self, idx):
-        wav, _sr = load_wav_mono(self.paths[idx], normalize=self.normalize)
+        wav, _sr = load_wav_mono(self.paths[idx], target_sr=self.target_sr, normalize=self.normalize)
         wav = fix_length(wav, self.target_len, train=self.train)
         if self.augment:
             wav = self._augment_waveform(wav)
