@@ -64,6 +64,43 @@ By default we train on the band-pass-filtered wavs (`*_50_500hz.wav`). Use
 `--use-filtered False` to train on the raw wavs instead. If you have the manifest
 CSV (`source_csv,wav_path,filtered_path`) on the volume, pass `--manifest /data/...csv`.
 
+## Labels in the manifest CSV
+
+The label is the keyword that prefixes each file name after `<speaker>/`
+(`begin_activity`, `stop_activity`, `wake_up`, `end`, `emergency`). You can
+materialize it as a `label` column in the manifest and have training read it from
+there (it takes precedence over filename parsing; rows labeled `unknown` are
+skipped). Same parser is used either way, so they stay consistent.
+
+Add the column locally:
+
+```bash
+python bcresnet_imu_kws/add_labels_to_manifest.py manifest.csv manifest_labeled.csv
+```
+
+...or generate/commit it on the volume:
+
+```bash
+# augment an existing CSV on the volume
+modal run bcresnet_imu_kws/make_manifest_modal.py --in-csv /data/manifest.csv
+# or build a fresh labeled manifest by scanning the recordings
+modal run bcresnet_imu_kws/make_manifest_modal.py
+```
+
+Then train against it:
+
+```bash
+modal run bcresnet_imu_kws/train_modal.py --manifest /data/manifest_labeled.csv
+```
+
+The resulting CSV adds one column:
+
+```
+source_csv,wav_path,filtered_path,label
+arnav/begin_activity_..._accel.csv,arnav/begin_activity_..._accel.wav,arnav/begin_activity_..._accel_50_500hz.wav,begin_activity
+arnav/emergency_..._accel.csv,arnav/emergency_..._accel.wav,arnav/emergency_..._accel_50_500hz.wav,emergency
+```
+
 ## Usage
 
 ```bash

@@ -14,7 +14,7 @@ import torch
 import torchaudio
 from torch.utils.data import Dataset
 
-from .labels import filename_to_label
+from .labels import CLASS_TO_IDX, filename_to_label
 
 FILTERED_SUFFIX = "_50_500hz.wav"
 
@@ -56,17 +56,47 @@ def list_wav_files(wav_dir, use_filtered=True, manifest=None):
     return sorted(set(files))
 
 
+def read_manifest(manifest, wav_dir, use_filtered=True):
+    """Return a list of ``(abs_path, label_str_or_None)`` from a manifest CSV.
+
+    Uses the ``label`` column when present (the user-provided / generated labels);
+    otherwise the label is left as ``None`` and the caller falls back to parsing the
+    file name.
+    """
+    entries = []
+    with open(manifest, newline="") as f:
+        reader = csv.DictReader(f)
+        cols = reader.fieldnames or []
+        path_col = "filtered_path" if (use_filtered and "filtered_path" in cols) else "wav_path"
+        has_label = "label" in cols
+        for row in reader:
+            rel = (row.get(path_col) or row.get("wav_path") or "").strip()
+            if not rel:
+                continue
+            lab = (row.get("label") or "").strip() if has_label else ""
+            entries.append((os.path.join(wav_dir, rel), lab or None))
+    return entries
+
+
 def build_index(wav_dir, use_filtered=True, manifest=None, target_sr=TARGET_SR, strict_sr=False):
     """Return ``(paths, labels, skipped)`` keeping only readable, labeled files.
 
-    Gracefully drops the stray malformed file and anything that fails to parse
-    to a known class or fails to open. When ``strict_sr`` is True, files whose
-    native sample rate differs from ``target_sr`` (3.3 kHz) are also skipped;
-    otherwise they are kept and resampled to ``target_sr`` at load time.
+    Label source priority: the manifest ``label`` column (if it names a known class)
+    -> otherwise parsed from the file name. Gracefully drops the stray malformed file
+    and anything that fails to parse to a known class or fails to open. When
+    ``strict_sr`` is True, files not at ``target_sr`` (3.3 kHz) are skipped too.
     """
+    if manifest and os.path.isfile(manifest):
+        entries = read_manifest(manifest, wav_dir, use_filtered)
+    else:
+        entries = [(p, None) for p in list_wav_files(wav_dir, use_filtered, None)]
+
     paths, labels, skipped = [], [], []
-    for p in list_wav_files(wav_dir, use_filtered, manifest):
-        lab = filename_to_label(p)
+    for p, lab_str in entries:
+        if lab_str and lab_str in CLASS_TO_IDX:
+            lab = CLASS_TO_IDX[lab_str]
+        else:
+            lab = filename_to_label(p)  # fallback when label missing / "unknown"
         if lab is None:
             skipped.append((p, "no-label"))
             continue
