@@ -36,7 +36,8 @@ def inspect(use_filtered: bool = True, manifest: str = None):
 
     sys.path.insert(0, "/root/app")
     from imu_kws.dataset import build_index
-    from imu_kws.labels import IDX_TO_CLASS
+    from imu_kws.labels import IDX_TO_CLASS, CLASSES, NUM_CLASSES
+    from imu_kws.splits import speaker_from_path
 
     paths, labels, skipped = build_index(WAV_DIR, use_filtered, manifest)
     counts = collections.Counter(IDX_TO_CLASS[l] for l in labels)
@@ -62,10 +63,32 @@ def inspect(use_filtered: bool = True, manifest: str = None):
         print("length seconds min/median/p99/max:      %.2f / %.2f / %.2f / %.2f" % (
             a.min() / 3333.0, np.median(a) / 3333.0,
             np.percentile(a, 99) / 3333.0, a.max() / 3333.0))
-    print("skipped:", len(skipped))
+
+    # --- speaker breakdown (== LOSO fold count) ---
+    spk_of = [speaker_from_path(p, WAV_DIR) for p in paths]
+    spk_total = collections.Counter(spk_of)
+    # per-class: how many distinct speakers contain it (rare-class concentration risk)
+    class_speakers = {c: set() for c in range(NUM_CLASSES)}
+    for s, l in zip(spk_of, labels):
+        class_speakers[l].add(s)
+    print("\nspeakers: %d  (=> %d LOSO folds)" % (len(spk_total), len(spk_total)))
+    print("files per speaker (min/median/max): %d / %d / %d" % (
+        min(spk_total.values()), int(np.median(list(spk_total.values()))), max(spk_total.values())))
+    print("per-class speaker coverage (how many speakers have each class):")
+    for c in range(NUM_CLASSES):
+        n_spk = len(class_speakers[c])
+        flag = "  <-- concentrated, risky for LOSO" if n_spk <= 2 else ""
+        print("  %-15s %d/%d speakers%s" % (CLASSES[c], n_spk, len(spk_total), flag))
+
+    print("\nskipped:", len(skipped))
     for item in skipped[:10]:
         print("  -", item)
-    return {"usable": len(paths), "per_class": dict(counts), "skipped": len(skipped)}
+    return {
+        "usable": len(paths),
+        "per_class": dict(counts),
+        "skipped": len(skipped),
+        "num_speakers": len(spk_total),
+    }
 
 
 @app.local_entrypoint()
