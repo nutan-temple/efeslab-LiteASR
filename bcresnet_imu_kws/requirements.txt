@@ -1,0 +1,9 @@
+modal
+torch==2.3.1
+torchaudio==2.3.1
+numpy<2
+scipy
+scikit-learn
+soundfile
+tqdm
+requests

@@ -1,0 +1,177 @@
+"""Dataset / data-indexing utilities for 3333 Hz IMU (accel-Z) keyword wavs.
+
+We deliberately do NOT reuse the vendored ``Padding`` / ``SpeechCommand`` classes
+because they are hardcoded to Google Speech Commands (16 kHz, directory-based
+labels). Everything here is new code; the vendored BC-ResNet files stay untouched.
+"""
+
+import csv
+import os
+import random
+
+import numpy as np
+import torch
+import torchaudio
+from torch.utils.data import Dataset
+
+from .labels import filename_to_label
+
+FILTERED_SUFFIX = "_50_500hz.wav"
+
+
+def list_wav_files(wav_dir, use_filtered=True, manifest=None):
+    """Collect the wav paths we want to train on.
+
+    If ``manifest`` (a CSV with columns ``source_csv,wav_path,filtered_path``) is
+    given and exists, we trust it as the source of truth. Otherwise we walk
+    ``wav_dir`` and pick either the band-pass-filtered wavs (``*_50_500hz.wav``)
+    or the raw wavs, never both.
+    """
+    files = []
+    if manifest and os.path.isfile(manifest):
+        col = "filtered_path" if use_filtered else "wav_path"
+        with open(manifest, newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                rel = (row.get(col) or row.get("wav_path") or "").strip()
+                if rel:
+                    files.append(os.path.join(wav_dir, rel))
+    else:
+        for root, _, fnames in os.walk(wav_dir):
+            for fn in fnames:
+                low = fn.lower()
+                if not low.endswith(".wav"):
+                    continue
+                is_filtered = low.endswith(FILTERED_SUFFIX)
+                if use_filtered and not is_filtered:
+                    continue
+                if not use_filtered and is_filtered:
+                    continue
+                files.append(os.path.join(root, fn))
+    return sorted(set(files))
+
+
+def build_index(wav_dir, use_filtered=True, manifest=None):
+    """Return ``(paths, labels, skipped)`` keeping only readable, labeled files.
+
+    Gracefully drops the stray malformed file and anything that fails to parse
+    to a known class or fails to open.
+    """
+    paths, labels, skipped = [], [], []
+    for p in list_wav_files(wav_dir, use_filtered, manifest):
+        lab = filename_to_label(p)
+        if lab is None:
+            skipped.append((p, "no-label"))
+            continue
+        if not os.path.isfile(p):
+            skipped.append((p, "missing"))
+            continue
+        try:
+            info = torchaudio.info(p)
+            if info.num_frames <= 0:
+                skipped.append((p, "empty"))
+                continue
+        except Exception as exc:  # malformed / unreadable wav
+            skipped.append((p, "unreadable: %s" % exc))
+            continue
+        paths.append(p)
+        labels.append(lab)
+    return paths, labels, skipped
+
+
+def compute_fixed_len(paths, percentile=99.0):
+    """Pick a single fixed input length (in samples) from the data itself.
+
+    Using a high percentile (default 99th) avoids guessing a duration and only
+    crops a handful of unusually long outliers, while everything shorter is
+    zero-padded. This is data-driven rather than brute-forced.
+    """
+    lengths = []
+    for p in paths:
+        try:
+            lengths.append(torchaudio.info(p).num_frames)
+        except Exception:
+            pass
+    if not lengths:
+        return 1
+    return int(np.percentile(np.asarray(lengths, dtype=np.float64), percentile))
+
+
+def load_wav_mono(path, normalize=True):
+    """Load a wav as a mono ``[1, L]`` float tensor, optionally peak-normalized."""
+    wav, sr = torchaudio.load(path)  # [C, L]
+    if wav.shape[0] > 1:
+        wav = wav.mean(dim=0, keepdim=True)
+    if normalize:
+        peak = wav.abs().max()
+        if peak > 0:
+            wav = wav / (peak + 1e-8)
+    return wav, sr
+
+
+def fix_length(wav, target_len, train=False):
+    """Pad (random/center) or crop (random/center) a ``[1, L]`` wav to ``target_len``."""
+    length = wav.shape[-1]
+    if length == target_len:
+        return wav
+    if length < target_len:
+        pad = target_len - length
+        left = random.randint(0, pad) if train else pad // 2
+        return torch.nn.functional.pad(wav, (left, pad - left))
+    # length > target_len -> crop
+    start = random.randint(0, length - target_len) if train else (length - target_len) // 2
+    return wav[..., start:start + target_len]
+
+
+class IMUKeywordDataset(Dataset):
+    """Returns ``([1, target_len] waveform, int label)``.
+
+    Light, sample-rate-agnostic waveform augmentation (gain / circular time-shift /
+    additive gaussian noise) is applied only for the training split. The mel /
+    SpecAugment stage is handled later by the vendored ``Preprocess``.
+    """
+
+    def __init__(
+        self,
+        paths,
+        labels,
+        target_len,
+        train=False,
+        augment=False,
+        normalize=True,
+        noise_std=0.005,
+        gain_db=3.0,
+        shift_frac=0.1,
+    ):
+        self.paths = list(paths)
+        self.labels = list(labels)
+        self.target_len = int(target_len)
+        self.train = train
+        self.augment = bool(augment and train)
+        self.normalize = normalize
+        self.noise_std = noise_std
+        self.gain_db = gain_db
+        self.shift_frac = shift_frac
+
+    def __len__(self):
+        return len(self.paths)
+
+    def _augment_waveform(self, wav):
+        if self.gain_db and self.gain_db > 0:
+            gain = 10 ** (random.uniform(-self.gain_db, self.gain_db) / 20.0)
+            wav = wav * gain
+        if self.shift_frac and self.shift_frac > 0:
+            n = wav.shape[-1]
+            shift = int(random.uniform(-self.shift_frac, self.shift_frac) * n)
+            if shift != 0:
+                wav = torch.roll(wav, shifts=shift, dims=-1)
+        if self.noise_std and self.noise_std > 0:
+            wav = wav + torch.randn_like(wav) * self.noise_std
+        return wav
+
+    def __getitem__(self, idx):
+        wav, _sr = load_wav_mono(self.paths[idx], normalize=self.normalize)
+        wav = fix_length(wav, self.target_len, train=self.train)
+        if self.augment:
+            wav = self._augment_waveform(wav)
+        return wav, self.labels[idx]
