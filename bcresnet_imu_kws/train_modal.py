@@ -70,6 +70,7 @@ def train_remote(
     val_frac: float = 0.10,
     loso: bool = True,
     optimizer: str = "sgd",
+    standardize: bool = True,
 ):
     import sys
 
@@ -104,6 +105,7 @@ def train_remote(
         test_frac=test_frac,
         val_frac=val_frac,
         optimizer=optimizer,
+        standardize=standardize,
         num_workers=4,
     )
 
@@ -218,6 +220,7 @@ def main(
     balanced_sampler: bool = False,
     strict_sr: bool = False,
     loso: bool = True,
+    standardize: bool = True,
 ):
     summary = train_remote.remote(
         tau=tau,
@@ -231,6 +234,7 @@ def main(
         balanced_sampler=balanced_sampler,
         strict_sr=strict_sr,
         loso=loso,
+        standardize=standardize,
     )
     if summary.get("mode") == "loso":
         keys = ("pooled_acc", "pooled_macro_f1", "fold_macro_f1_mean",

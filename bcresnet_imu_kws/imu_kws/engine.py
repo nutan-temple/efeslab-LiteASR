@@ -115,14 +115,25 @@ def _make_loaders(splits, target_len, batch_size, balanced_sampler, num_workers,
     return (ds_tr, ds_va, ds_te), (tr_loader, va_loader, te_loader)
 
 
+def _standardize(feats, eps=1e-5):
+    """Per-utterance standardization of the log-mel features (zero mean, unit std
+    over freq+time, per sample). Removes per-recording offset/scale, which helps
+    consistency across speakers/sessions."""
+    m = feats.mean(dim=(1, 2, 3), keepdim=True)
+    s = feats.std(dim=(1, 2, 3), keepdim=True)
+    return (feats - m) / (s + eps)
+
+
 @torch.no_grad()
-def evaluate(model, loader, preprocess, device):
+def evaluate(model, loader, preprocess, device, standardize=False):
     model.eval()
     y_true, y_pred = [], []
     for inputs, labels in loader:
         inputs = inputs.to(device)
         labels = labels.to(device)
         feats = preprocess(inputs, labels, augment=False, is_train=False)
+        if standardize:
+            feats = _standardize(feats)
         outputs = model(feats)
         preds = outputs.argmax(dim=-1)
         y_true.append(labels.cpu().numpy())
@@ -153,6 +164,7 @@ def _train_core(cfg, device, splits, target_len, sample_rate, on_best=None, verb
             cfg["tau"], n_params, n_params * 4 / 1024.0))
 
     pre_train, pre_eval = build_preprocessors(device, cfg["tau"], sample_rate=sample_rate)
+    do_std = bool(cfg.get("standardize", True))
 
     if cfg["balanced_sampler"]:
         ce_weight = None
@@ -196,6 +208,8 @@ def _train_core(cfg, device, splits, target_len, sample_rate, on_best=None, verb
             inputs = inputs.to(device)
             lab = lab.to(device)
             feats = pre_train(inputs, lab, augment=False, is_train=True)
+            if do_std:
+                feats = _standardize(feats)
             outputs = model(feats)
             loss = F.cross_entropy(outputs, lab, weight=ce_weight)
             loss.backward()
@@ -211,7 +225,7 @@ def _train_core(cfg, device, splits, target_len, sample_rate, on_best=None, verb
         train_acc = 100.0 * tr_correct / max(1, tr_total)
 
         if has_val:
-            va_acc, va_f1, _, _ = evaluate(model, va_loader, pre_eval, device)
+            va_acc, va_f1, _, _ = evaluate(model, va_loader, pre_eval, device, standardize=do_std)
             if verbose:
                 print("epoch %3d/%d | lr %.4f | train_loss %.3f train_acc %.2f | val_acc %.2f val_macroF1 %.4f%s" % (
                     epoch + 1, cfg["epochs"], lr, train_loss, train_acc, va_acc, va_f1,
@@ -242,7 +256,7 @@ def _train_core(cfg, device, splits, target_len, sample_rate, on_best=None, verb
     if best_state is not None:
         model.load_state_dict(best_state)
 
-    te_acc, te_f1, y_true, y_pred = evaluate(model, te_loader, pre_eval, device)
+    te_acc, te_f1, y_true, y_pred = evaluate(model, te_loader, pre_eval, device, standardize=do_std)
     report = classification_report(y_true, y_pred, labels=list(range(NUM_CLASSES)),
                                    target_names=CLASSES, digits=4, zero_division=0)
     cm = confusion_matrix(y_true, y_pred, labels=list(range(NUM_CLASSES))).tolist()
