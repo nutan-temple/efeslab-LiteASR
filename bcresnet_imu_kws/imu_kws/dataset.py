@@ -160,6 +160,16 @@ def load_wav_mono(path, target_sr=TARGET_SR, normalize=True):
     return wav, target_sr
 
 
+def load_wav_1d_np(path, target_sr=TARGET_SR):
+    """Load a wav as a mono 1-D float32 numpy array at ``target_sr`` (3.3 kHz)."""
+    wav, sr = torchaudio.load(path)  # [C, L]
+    if wav.shape[0] > 1:
+        wav = wav.mean(dim=0, keepdim=True)
+    if sr != target_sr:
+        wav = torchaudio.functional.resample(wav, orig_freq=sr, new_freq=target_sr)
+    return wav.squeeze(0).numpy().astype(np.float32)
+
+
 def fix_length(wav, target_len, train=False):
     """Pad (random/center) or crop (random/center) a ``[1, L]`` wav to ``target_len``."""
     length = wav.shape[-1]
@@ -194,6 +204,7 @@ class IMUKeywordDataset(Dataset):
         noise_std=0.005,
         gain_db=3.0,
         shift_frac=0.1,
+        preproc_fn=None,
     ):
         self.paths = list(paths)
         self.labels = list(labels)
@@ -205,6 +216,20 @@ class IMUKeywordDataset(Dataset):
         self.noise_std = noise_std
         self.gain_db = gain_db
         self.shift_frac = shift_frac
+        # When set, a numpy ``x -> x`` pipeline (HP filter / norm / crop_max_energy)
+        # produces a fixed-length 1-D clip and __getitem__ returns a [T] tensor.
+        self.preproc_fn = preproc_fn
+
+    def _augment_np(self, x):
+        if self.gain_db and self.gain_db > 0:
+            x = x * (10 ** (random.uniform(-self.gain_db, self.gain_db) / 20.0))
+        if self.shift_frac and self.shift_frac > 0:
+            shift = int(random.uniform(-self.shift_frac, self.shift_frac) * len(x))
+            if shift != 0:
+                x = np.roll(x, shift)
+        if self.noise_std and self.noise_std > 0:
+            x = x + np.random.randn(len(x)).astype(np.float32) * self.noise_std
+        return x.astype(np.float32)
 
     def __len__(self):
         return len(self.paths)
@@ -223,6 +248,12 @@ class IMUKeywordDataset(Dataset):
         return wav
 
     def __getitem__(self, idx):
+        if self.preproc_fn is not None:
+            x = load_wav_1d_np(self.paths[idx], target_sr=self.target_sr)
+            x = self.preproc_fn(x)  # fixed-length 1-D window
+            if self.augment:
+                x = self._augment_np(x)
+            return torch.from_numpy(np.ascontiguousarray(x, dtype=np.float32)), self.labels[idx]
         wav, _sr = load_wav_mono(self.paths[idx], target_sr=self.target_sr, normalize=self.normalize)
         wav = fix_length(wav, self.target_len, train=self.train)
         if self.augment:

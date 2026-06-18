@@ -41,8 +41,11 @@ _VENDOR_BCRESNET = os.path.abspath(os.path.join(_HERE, "..", "vendor", "bcresnet
 if _VENDOR_BCRESNET not in sys.path:
     sys.path.insert(0, _VENDOR_BCRESNET)
 
-from bcresnet import BCResNets  # noqa: E402  (Qualcomm, unmodified)
-from utils import Preprocess    # noqa: E402  (Qualcomm, unmodified)
+from bcresnet import BCResNets       # noqa: E402  (Qualcomm, unmodified)
+from utils import Preprocess, spec_augment  # noqa: E402  (Qualcomm, unmodified)
+
+from .features import build_feature  # noqa: E402
+from .preprocessing import build_preproc  # noqa: E402
 
 # n_mels is fixed by the BC-ResNet architecture - do not change.
 N_MELS = 40
@@ -87,14 +90,18 @@ def build_preprocessors(device, tau, sample_rate=TARGET_SR):
     return pre_train, pre_eval
 
 
-def _make_loaders(splits, target_len, batch_size, balanced_sampler, num_workers, target_sr=TARGET_SR):
+def _make_loaders(splits, target_len, batch_size, balanced_sampler, num_workers,
+                  target_sr=TARGET_SR, preproc_fn=None):
     p_tr, y_tr = splits["train"]
     p_va, y_va = splits["valid"]
     p_te, y_te = splits["test"]
 
-    ds_tr = IMUKeywordDataset(p_tr, y_tr, target_len, train=True, augment=True, target_sr=target_sr)
-    ds_va = IMUKeywordDataset(p_va, y_va, target_len, train=False, augment=False, target_sr=target_sr)
-    ds_te = IMUKeywordDataset(p_te, y_te, target_len, train=False, augment=False, target_sr=target_sr)
+    ds_tr = IMUKeywordDataset(p_tr, y_tr, target_len, train=True, augment=True,
+                              target_sr=target_sr, preproc_fn=preproc_fn)
+    ds_va = IMUKeywordDataset(p_va, y_va, target_len, train=False, augment=False,
+                              target_sr=target_sr, preproc_fn=preproc_fn)
+    ds_te = IMUKeywordDataset(p_te, y_te, target_len, train=False, augment=False,
+                              target_sr=target_sr, preproc_fn=preproc_fn)
 
     if balanced_sampler:
         counts = np.bincount(y_tr, minlength=NUM_CLASSES).astype(np.float64)
@@ -125,15 +132,13 @@ def _standardize(feats, eps=1e-5):
 
 
 @torch.no_grad()
-def evaluate(model, loader, preprocess, device, standardize=False):
+def evaluate(model, loader, featurize, device):
     model.eval()
     y_true, y_pred = [], []
     for inputs, labels in loader:
         inputs = inputs.to(device)
         labels = labels.to(device)
-        feats = preprocess(inputs, labels, augment=False, is_train=False)
-        if standardize:
-            feats = _standardize(feats)
+        feats = featurize(inputs, labels, train=False)
         outputs = model(feats)
         preds = outputs.argmax(dim=-1)
         y_true.append(labels.cpu().numpy())
@@ -145,7 +150,7 @@ def evaluate(model, loader, preprocess, device, standardize=False):
     return acc, macro_f1, y_true, y_pred
 
 
-def _train_core(cfg, device, splits, target_len, sample_rate, on_best=None, verbose=True):
+def _train_core(cfg, device, splits, target_len, sample_rate, preproc_fn=None, on_best=None, verbose=True):
     """Train one model on the given ``splits`` and evaluate on its test set.
 
     Returns a results dict including the pooled ``y_true``/``y_pred`` for the test
@@ -153,7 +158,7 @@ def _train_core(cfg, device, splits, target_len, sample_rate, on_best=None, verb
     """
     (_, _, _), (tr_loader, va_loader, te_loader) = _make_loaders(
         splits, target_len, cfg["batch_size"], cfg["balanced_sampler"],
-        cfg.get("num_workers", 4), target_sr=sample_rate,
+        cfg.get("num_workers", 4), target_sr=sample_rate, preproc_fn=preproc_fn,
     )
     has_val = len(splits["valid"][1]) > 0
 
@@ -165,6 +170,33 @@ def _train_core(cfg, device, splits, target_len, sample_rate, on_best=None, verb
 
     pre_train, pre_eval = build_preprocessors(device, cfg["tau"], sample_rate=sample_rate)
     do_std = bool(cfg.get("standardize", True))
+
+    # --- pluggable feature stage -------------------------------------------------
+    feat_name = cfg.get("feature", "logmel_40")
+    use_module = bool(feat_name) and feat_name != "vendored"
+    if use_module:
+        fe = build_feature(
+            feat_name, sample_rate=sample_rate,
+            f_min=cfg.get("fmin", 50.0), f_max=cfg.get("fmax", 500.0),
+        ).to(device)
+        do_specaug = bool(cfg.get("specaug", True))
+        f_para = _FREQ_MASK_PARA.get(cfg["tau"], 5) or 5
+
+        def featurize(x, labels, train):
+            # module features expect [B, T]; the dataset returns [T] -> [B, T]
+            if x.dim() == 3:
+                x = x.squeeze(1)
+            feats = fe(x)  # [B, 1, 40, frames], already mean/var normalized
+            if train and do_specaug:
+                for i in range(feats.shape[0]):
+                    feats[i] = spec_augment(feats[i], f_para, 15, 2, 2)
+            return feats
+    else:
+        def featurize(x, labels, train):
+            feats = (pre_train if train else pre_eval)(x, labels, augment=False, is_train=train)
+            if do_std:
+                feats = _standardize(feats)
+            return feats
 
     if cfg["balanced_sampler"]:
         ce_weight = None
@@ -207,9 +239,7 @@ def _train_core(cfg, device, splits, target_len, sample_rate, on_best=None, verb
 
             inputs = inputs.to(device)
             lab = lab.to(device)
-            feats = pre_train(inputs, lab, augment=False, is_train=True)
-            if do_std:
-                feats = _standardize(feats)
+            feats = featurize(inputs, lab, train=True)
             outputs = model(feats)
             loss = F.cross_entropy(outputs, lab, weight=ce_weight)
             loss.backward()
@@ -225,7 +255,7 @@ def _train_core(cfg, device, splits, target_len, sample_rate, on_best=None, verb
         train_acc = 100.0 * tr_correct / max(1, tr_total)
 
         if has_val:
-            va_acc, va_f1, _, _ = evaluate(model, va_loader, pre_eval, device, standardize=do_std)
+            va_acc, va_f1, _, _ = evaluate(model, va_loader, featurize, device)
             if verbose:
                 print("epoch %3d/%d | lr %.4f | train_loss %.3f train_acc %.2f | val_acc %.2f val_macroF1 %.4f%s" % (
                     epoch + 1, cfg["epochs"], lr, train_loss, train_acc, va_acc, va_f1,
@@ -256,7 +286,7 @@ def _train_core(cfg, device, splits, target_len, sample_rate, on_best=None, verb
     if best_state is not None:
         model.load_state_dict(best_state)
 
-    te_acc, te_f1, y_true, y_pred = evaluate(model, te_loader, pre_eval, device, standardize=do_std)
+    te_acc, te_f1, y_true, y_pred = evaluate(model, te_loader, featurize, device)
     report = classification_report(y_true, y_pred, labels=list(range(NUM_CLASSES)),
                                    target_names=CLASSES, digits=4, zero_division=0)
     cm = confusion_matrix(y_true, y_pred, labels=list(range(NUM_CLASSES))).tolist()
@@ -296,16 +326,28 @@ def _prepare(cfg):
     if skipped:
         print("skipped %d files (e.g. %s)" % (len(skipped), skipped[:3]))
 
-    target_len = cfg.get("target_len") or compute_fixed_len(
-        paths, cfg["length_percentile"], target_sr=sample_rate)
-    print("fixed input length: %d samples (~%.2fs @ %d Hz)" % (
-        target_len, target_len / float(sample_rate), sample_rate))
-    return paths, labels, skipped, target_len, sample_rate
+    feat_name = cfg.get("feature", "logmel_40")
+    use_module = bool(feat_name) and feat_name != "vendored"
+    if use_module:
+        window_samples = cfg.get("window_samples") or int(round(
+            cfg.get("window_seconds", 2.5) * sample_rate))
+        preproc_fn = build_preproc(cfg.get("preproc", "hp_peak_crop"), window_samples, sample_rate)
+        target_len = window_samples
+        print("front-end: feature=%s preproc=%s | window=%d samples (~%.2fs) | mel band %.0f-%.0f Hz" % (
+            feat_name, cfg.get("preproc", "hp_peak_crop"), window_samples,
+            window_samples / float(sample_rate), cfg.get("fmin", 50.0), cfg.get("fmax", 500.0)))
+    else:
+        preproc_fn = None
+        target_len = cfg.get("target_len") or compute_fixed_len(
+            paths, cfg["length_percentile"], target_sr=sample_rate)
+        print("front-end: vendored LogMel | fixed input length: %d samples (~%.2fs @ %d Hz)" % (
+            target_len, target_len / float(sample_rate), sample_rate))
+    return paths, labels, skipped, target_len, sample_rate, preproc_fn
 
 
 def train(cfg, device, on_best=None):
     """Single speaker-disjoint 80/10/10 split, train once, test once."""
-    paths, labels, skipped, target_len, sample_rate = _prepare(cfg)
+    paths, labels, skipped, target_len, sample_rate, preproc_fn = _prepare(cfg)
 
     splits = make_speaker_disjoint_splits(
         paths, labels, cfg["wav_dir"], seed=cfg["seed"],
@@ -314,7 +356,8 @@ def train(cfg, device, on_best=None):
     for name in ("train", "valid", "test"):
         print("  %-5s: %d" % (name, len(splits[name][1])))
 
-    res = _train_core(cfg, device, splits, target_len, sample_rate, on_best=on_best, verbose=True)
+    res = _train_core(cfg, device, splits, target_len, sample_rate,
+                      preproc_fn=preproc_fn, on_best=on_best, verbose=True)
     res.update({"target_len": int(target_len), "skipped": skipped})
     print("\n=== TEST ===\nacc %.2f | macroF1 %.4f\n%s\nconfusion_matrix=%s" % (
         res["test_acc"], res["test_macro_f1"], res["report"], res["confusion_matrix"]))
@@ -328,7 +371,7 @@ def run_loso(cfg, device, on_fold=None):
     if given, is called as ``on_fold(test_speaker, state_dict, epoch, val_f1)`` on
     each fold's best checkpoint (used to save + commit per-fold models on Modal).
     """
-    paths, labels, skipped, target_len, sample_rate = _prepare(cfg)
+    paths, labels, skipped, target_len, sample_rate, preproc_fn = _prepare(cfg)
 
     folds, speakers = leave_one_speaker_out_plan(paths, labels, cfg["wav_dir"])
     print("LOSO: %d folds over %d speakers: %s" % (len(folds), len(speakers), speakers))
@@ -350,7 +393,7 @@ def run_loso(cfg, device, on_fold=None):
                 on_fold(_ts, state, epoch, f1)
 
         res = _train_core(cfg, device, splits, target_len, sample_rate,
-                          on_best=fold_on_best, verbose=True)
+                          preproc_fn=preproc_fn, on_best=fold_on_best, verbose=True)
         last_n_params = res["n_params"]
         pooled_true.append(res["y_true"])
         pooled_pred.append(res["y_pred"])

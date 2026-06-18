@@ -30,6 +30,22 @@ Classes: `begin_activity`, `stop_activity`, `wake_up`, `end`, `emergency`.
   (sample-rate-correct) LogMel + SpecAugment run. Light waveform augmentation
   (gain / time-shift / gaussian noise) is done in our own dataset.
 
+### Front-end (waveform preprocessing + features)
+
+The front-end is configurable (adapted from the provided script):
+
+- **Waveform preproc** (`--preproc`, numpy/scipy, per clip): high-pass Butterworth
+  (80 Hz) + normalization + `crop_max_energy` (takes the highest-energy fixed
+  window instead of padding to several seconds). Choices: `hp_peak_crop` (default),
+  `hp_peak_trim_crop` (adds silence trim), `no_hp`, `hp_rms_crop`.
+- **Window length** (`--window-seconds`, default 2.5 s) sets the crop size.
+- **Feature** (`--feature`): `logmel_40` (default), `mel_linear`, or `pcen`. All are
+  band-limited to `--fmin`/`--fmax` (default **50-500 Hz**) so the 40 mel bins land
+  on the informative IMU band, and are mean/var normalized per utterance.
+- `logmel_30`, `logmel_64`, `logmel_deltas` are **not** usable with the unmodified
+  BC-ResNet (it requires 40 mels / 1 channel) and raise a clear error.
+- `--feature vendored` falls back to the original vendored LogMel + length-percentile path.
+
 ### Accuracy-oriented choices (not brute force)
 - **Evaluation defaults to Leave-One-Speaker-Out (LOSO) cross-validation**: each
   speaker is held out as the test set in turn, the model is trained on the others,

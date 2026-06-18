@@ -71,6 +71,12 @@ def train_remote(
     loso: bool = True,
     optimizer: str = "sgd",
     standardize: bool = True,
+    feature: str = "logmel_40",
+    preproc: str = "hp_peak_crop",
+    window_seconds: float = 2.5,
+    fmin: float = 50.0,
+    fmax: float = 500.0,
+    specaug: bool = True,
 ):
     import sys
 
@@ -84,7 +90,9 @@ def train_remote(
     print("device:", device)
     os.makedirs(OUT_DIR, exist_ok=True)
 
-    mel_cfg = dict(sample_rate=target_sr, n_fft=512, win_length=256, hop_length=64, n_mels=40)
+    mel_cfg = dict(sample_rate=target_sr, n_fft=512, hop_length=64, n_mels=40,
+                   feature=feature, preproc=preproc, window_seconds=window_seconds,
+                   fmin=fmin, fmax=fmax)
     cfg = dict(
         wav_dir=WAV_DIR,
         use_filtered=use_filtered,
@@ -106,6 +114,12 @@ def train_remote(
         val_frac=val_frac,
         optimizer=optimizer,
         standardize=standardize,
+        feature=feature,
+        preproc=preproc,
+        window_seconds=window_seconds,
+        fmin=fmin,
+        fmax=fmax,
+        specaug=specaug,
         num_workers=4,
     )
 
@@ -221,6 +235,9 @@ def main(
     strict_sr: bool = False,
     loso: bool = True,
     standardize: bool = True,
+    feature: str = "logmel_40",
+    preproc: str = "hp_peak_crop",
+    window_seconds: float = 2.5,
 ):
     summary = train_remote.remote(
         tau=tau,
@@ -235,6 +252,9 @@ def main(
         strict_sr=strict_sr,
         loso=loso,
         standardize=standardize,
+        feature=feature,
+        preproc=preproc,
+        window_seconds=window_seconds,
     )
     if summary.get("mode") == "loso":
         keys = ("pooled_acc", "pooled_macro_f1", "fold_macro_f1_mean",
