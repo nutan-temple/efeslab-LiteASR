@@ -331,11 +331,14 @@ def _prepare(cfg):
     if use_module:
         window_samples = cfg.get("window_samples") or int(round(
             cfg.get("window_seconds", 2.5) * sample_rate))
-        preproc_fn = build_preproc(cfg.get("preproc", "hp_peak_crop"), window_samples, sample_rate)
+        preproc_fn = build_preproc(
+            cfg.get("preproc", "hp_peak_crop"), window_samples, sample_rate,
+            hp_cutoff=cfg.get("hp_cutoff", 40.0))
         target_len = window_samples
-        print("front-end: feature=%s preproc=%s | window=%d samples (~%.2fs) | mel band %.0f-%.0f Hz" % (
+        print("front-end: feature=%s preproc=%s | window=%d samples (~%.2fs) | HP %.0f Hz | mel band %.0f-%.0f Hz" % (
             feat_name, cfg.get("preproc", "hp_peak_crop"), window_samples,
-            window_samples / float(sample_rate), cfg.get("fmin", 50.0), cfg.get("fmax", 500.0)))
+            window_samples / float(sample_rate), cfg.get("hp_cutoff", 40.0),
+            cfg.get("fmin", 50.0), cfg.get("fmax", 500.0)))
     else:
         preproc_fn = None
         target_len = cfg.get("target_len") or compute_fixed_len(

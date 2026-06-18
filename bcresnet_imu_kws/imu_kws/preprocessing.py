@@ -23,7 +23,7 @@ FMIN = 50.0
 FMAX = 500.0
 N_FFT = 512
 HOP = 64
-HP_CUTOFF = 80.0
+HP_CUTOFF = 40.0
 
 
 def _hp_coeffs(sample_rate, cutoff=HP_CUTOFF, order=4):

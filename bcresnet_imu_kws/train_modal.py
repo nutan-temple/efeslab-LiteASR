@@ -76,6 +76,7 @@ def train_remote(
     window_seconds: float = 2.5,
     fmin: float = 50.0,
     fmax: float = 500.0,
+    hp_cutoff: float = 40.0,
     specaug: bool = True,
 ):
     import sys
@@ -92,7 +93,7 @@ def train_remote(
 
     mel_cfg = dict(sample_rate=target_sr, n_fft=512, hop_length=64, n_mels=40,
                    feature=feature, preproc=preproc, window_seconds=window_seconds,
-                   fmin=fmin, fmax=fmax)
+                   fmin=fmin, fmax=fmax, hp_cutoff=hp_cutoff)
     cfg = dict(
         wav_dir=WAV_DIR,
         use_filtered=use_filtered,
@@ -119,6 +120,7 @@ def train_remote(
         window_seconds=window_seconds,
         fmin=fmin,
         fmax=fmax,
+        hp_cutoff=hp_cutoff,
         specaug=specaug,
         num_workers=4,
     )
@@ -238,6 +240,7 @@ def main(
     feature: str = "logmel_40",
     preproc: str = "hp_peak_crop",
     window_seconds: float = 2.5,
+    hp_cutoff: float = 40.0,
 ):
     summary = train_remote.remote(
         tau=tau,
@@ -255,6 +258,7 @@ def main(
         feature=feature,
         preproc=preproc,
         window_seconds=window_seconds,
+        hp_cutoff=hp_cutoff,
     )
     if summary.get("mode") == "loso":
         keys = ("pooled_acc", "pooled_macro_f1", "fold_macro_f1_mean",
