@@ -1,8 +1,10 @@
 """Waveform preprocessing front-end (adapted from the user's Modal script).
 
 Numpy/scipy operations applied per clip in the dataset:
-  * high-pass Butterworth filter (default 80 Hz) to kill DC / low drift,
-  * peak or RMS normalization,
+  * high-pass Butterworth filter (default 25 Hz) to kill the gravity DC (~1 g) and
+    low-frequency body motion that otherwise dominate accel-Z,
+  * peak or RMS normalization (a single scalar gain; peak is the safe default,
+    RMS can amplify noise on near-silent clips),
   * optional silence trimming (energy VAD),
   * ``crop_max_energy``: take the highest-energy fixed window (or zero-pad if the
     clip is shorter) -> no more diluting the signal with seconds of padding.
@@ -18,10 +20,11 @@ from scipy.signal import butter, filtfilt
 from .dataset import TARGET_SR
 
 # Mel front-end defaults (used by features.py). Accelerometer/bone-conduction voice
-# pickup has useful content well above 500 Hz but the high end is attenuated/noisy,
-# so default to 40-1000 Hz (sweep f_max up to Nyquist=1666 on the RAW wavs).
+# pickup has useful content well above 500 Hz but the high end is attenuated/noisy.
+# Default to the (almost) full usable band 40-1600 Hz (Nyquist = 1666 Hz at 3.3 kHz);
+# you can narrow f_max (e.g. 1000/1200) if the top turns out to be mostly noise.
 FMIN = 40.0
-FMAX = 1000.0
+FMAX = 1600.0
 N_FFT = 512
 HOP = 64           # ~19 ms @ 3333 Hz (STFT step)
 WIN_LENGTH = 128   # ~38 ms @ 3333 Hz (STFT analysis window; << old implicit 154 ms)

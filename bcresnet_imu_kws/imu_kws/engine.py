@@ -179,7 +179,7 @@ def _train_core(cfg, device, splits, target_len, sample_rate, preproc_fn=None, o
             feat_name, sample_rate=sample_rate,
             n_fft=cfg.get("n_fft", 512), hop=cfg.get("hop", 64),
             win_length=cfg.get("win_length", 128),
-            f_min=cfg.get("fmin", 40.0), f_max=cfg.get("fmax", 1000.0),
+            f_min=cfg.get("fmin", 40.0), f_max=cfg.get("fmax", 1600.0),
         ).to(device)
         do_specaug = bool(cfg.get("specaug", True))
         f_para = _FREQ_MASK_PARA.get(cfg["tau"], 5) or 5
@@ -340,7 +340,7 @@ def _prepare(cfg):
         print("front-end: feature=%s preproc=%s | window=%d (~%.2fs) | HP %.0fHz | mel %.0f-%.0fHz | win_len=%d hop=%d n_fft=%d" % (
             feat_name, cfg.get("preproc", "hp_peak_crop"), window_samples,
             window_samples / float(sample_rate), cfg.get("hp_cutoff", 25.0),
-            cfg.get("fmin", 40.0), cfg.get("fmax", 1000.0),
+            cfg.get("fmin", 40.0), cfg.get("fmax", 1600.0),
             cfg.get("win_length", 128), cfg.get("hop", 64), cfg.get("n_fft", 512)))
     else:
         preproc_fn = None
