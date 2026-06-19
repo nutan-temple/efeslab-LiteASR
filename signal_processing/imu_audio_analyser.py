@@ -29,8 +29,7 @@ import pandas as pd
 import pywt
 import soundfile as sf
 from scipy import signal as sp_signal
-from scipy.linalg import toeplitz, solve_toeplitz
-from scipy.ndimage import gaussian_filter1d
+from scipy.linalg import solve_toeplitz
 from scipy.special import exp1
 
 warnings.filterwarnings("ignore")
@@ -344,7 +343,6 @@ def mmse_lsa_denoise(sig, fs, n_noise_frames=5, alpha_dd=0.98, floor_db=-30):
 
     # Decision-directed a priori SNR estimation and MMSE-LSA gain
     output_mag = np.zeros_like(mag)
-    xi_prev = np.ones(n_bins)  # Previous frame a priori SNR
 
     for i in range(n_frames):
         # A posteriori SNR
@@ -360,8 +358,6 @@ def mmse_lsa_denoise(sig, fs, n_noise_frames=5, alpha_dd=0.98, floor_db=-30):
             xi_ml = G_prev ** 2 * power[i - 1] / (noise_power + 1e-10)
             xi = alpha_dd * xi_ml + (1 - alpha_dd) * np.maximum(gamma - 1, 0)
             xi = np.maximum(xi, 0.01)
-
-        xi_prev = xi
 
         # MMSE-LSA gain computation
         # v = xi / (1 + xi) * gamma
@@ -500,8 +496,16 @@ def denoise_kalman(sig, fs):
 
 
 def denoise_bilateral_1d(sig, fs):
-    """1D bilateral filter - edge-preserving smoothing."""
+    """
+    1D bilateral filter - edge-preserving smoothing.
+    Skipped for signals longer than 50000 samples due to O(n * window)
+    complexity of the pure-Python implementation.
+    """
     n = len(sig)
+    if n > 50000:
+        # Too slow for long signals; fall back to a simple Gaussian smooth
+        from scipy.ndimage import gaussian_filter1d as _gf1d
+        return _gf1d(sig, sigma=5)
     sigma_d = 5
     sigma_r = np.std(sig) * 0.5
     if sigma_r < 1e-10:
@@ -554,18 +558,21 @@ def denoise_lpc(sig, fs):
     if autocorr[0] == 0:
         return sig
 
-    # Solve using Levinson-Durbin (via toeplitz)
+    # Solve Toeplitz system using O(n^2) Levinson-Durbin via solve_toeplitz
     r = autocorr[1:order + 1]
-    R = toeplitz(autocorr[:order])
     try:
-        a = np.linalg.solve(R, r)
-    except np.linalg.LinAlgError:
+        a = solve_toeplitz(autocorr[:order], r)
+    except (np.linalg.LinAlgError, ValueError):
         return sig
 
-    # LPC prediction
+    # LPC prediction using lfilter for speed (replaces O(n*order) Python loop)
+    # The prediction filter: y[n] = a[0]*x[n-1] + a[1]*x[n-2] + ... + a[order-1]*x[n-order]
+    # This is equivalent to filtering with b=a_coeffs, a=[1] shifted by 'order' samples
     predicted = np.zeros(n)
-    for i in range(order, n):
-        predicted[i] = np.dot(a, sig[i - order:i][::-1])
+    # Use lfilter: output[n] = sum(a[k] * sig[n-1-k]) for k=0..order-1
+    # Rewrite as FIR filter with coefficients a (reversed indexing already handled)
+    b_fir = a  # FIR coefficients
+    predicted[order:] = sp_signal.lfilter(b_fir, [1.0], sig)[order - 1:n - 1]
 
     # Blend prediction with original
     alpha = 0.7
@@ -575,7 +582,13 @@ def denoise_lpc(sig, fs):
 
 
 def denoise_adaptive_lms(sig, fs):
-    """Adaptive LMS noise cancellation."""
+    """
+    Adaptive LMS linear prediction error filter (whitening).
+    Predicts the current sample from past samples and outputs the
+    prediction residual. This emphasizes transients and removes
+    predictable (periodic) content -- useful as a pre-processor
+    but not a direct voice enhancer on its own.
+    """
     n = len(sig)
     filter_order = min(32, n // 4)
     if filter_order < 2:
@@ -629,8 +642,9 @@ def denoise_multiband(sig, fs):
                     dc.append(pywt.threshold(c, thresh, mode="soft"))
                 band_sig = pywt.waverec(dc, "db4")[:n]
             output += band_sig
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"  [WARN] multiband: band {low}-{high} Hz failed: {e}")
+            continue
 
     if np.max(np.abs(output)) < 1e-10:
         return sig
@@ -1082,6 +1096,11 @@ def compute_composite_score(metrics_norm):
     """
     Compute composite blind score (0-100) from normalized metrics.
     Higher = more voice-like / better quality.
+
+    NOTE: Scores are relative to the current run only. Because metrics are
+    min-max normalized across methods in a single execution, the worst method
+    always scores near 0 and the best near 100. Scores are not comparable
+    across different runs, presets, or when the method set changes.
     """
     score = 0.0
     # HNR: higher is better
@@ -1453,10 +1472,10 @@ def run_pipeline(input_file=None, output_dir="imu_analyser_output",
                             })
                             signals_output[variant_name] = out
                             print(f"  [OK] {variant_name:<35} HNR={metrics['hnr_db']:.1f} dB")
-                        except Exception:
-                            pass
-            except Exception:
-                pass
+                        except Exception as e:
+                            print(f"  [WARN] grid sweep {mkey} (gap={gm}) failed: {e}")
+            except Exception as e:
+                print(f"  [WARN] grid sweep gap_mode={gm} failed: {e}")
 
     if not all_results:
         print("\n  [ERROR] No methods produced output.")
