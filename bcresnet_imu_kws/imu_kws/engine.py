@@ -71,8 +71,8 @@ def build_preprocessors(device, tau, sample_rate=TARGET_SR):
     mel_kwargs = dict(
         sample_rate=sample_rate,
         n_fft=512,
-        win_length=256,   # ~77 ms @ 3333 Hz
-        hop_length=64,    # ~19 ms @ 3333 Hz
+        win_length=83,    # ~25 ms @ 3333 Hz
+        hop_length=33,    # ~10 ms @ 3333 Hz
         n_mels=N_MELS,
     )
     specaug = tau >= 1.5
@@ -177,8 +177,8 @@ def _train_core(cfg, device, splits, target_len, sample_rate, preproc_fn=None, o
     if use_module:
         fe = build_feature(
             feat_name, sample_rate=sample_rate,
-            n_fft=cfg.get("n_fft", 512), hop=cfg.get("hop", 64),
-            win_length=cfg.get("win_length", 128),
+            n_fft=cfg.get("n_fft", 512), hop=cfg.get("hop", 33),
+            win_length=cfg.get("win_length", 83),
             f_min=cfg.get("fmin", 40.0), f_max=cfg.get("fmax", 1600.0),
         ).to(device)
         do_specaug = bool(cfg.get("specaug", True))
@@ -332,7 +332,7 @@ def _prepare(cfg):
     use_module = bool(feat_name) and feat_name != "vendored"
     if use_module:
         window_samples = cfg.get("window_samples") or int(round(
-            cfg.get("window_seconds", 2.5) * sample_rate))
+            cfg.get("window_seconds", 2.0) * sample_rate))
         preproc_fn = build_preproc(
             cfg.get("preproc", "hp_peak_crop"), window_samples, sample_rate,
             hp_cutoff=cfg.get("hp_cutoff", 25.0))
@@ -341,7 +341,7 @@ def _prepare(cfg):
             feat_name, cfg.get("preproc", "hp_peak_crop"), window_samples,
             window_samples / float(sample_rate), cfg.get("hp_cutoff", 25.0),
             cfg.get("fmin", 40.0), cfg.get("fmax", 1600.0),
-            cfg.get("win_length", 128), cfg.get("hop", 64), cfg.get("n_fft", 512)))
+            cfg.get("win_length", 83), cfg.get("hop", 33), cfg.get("n_fft", 512)))
     else:
         preproc_fn = None
         target_len = cfg.get("target_len") or compute_fixed_len(

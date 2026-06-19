@@ -36,8 +36,8 @@ def parse_args(argv=None):
                              "resampled to 3333 Hz if needed).")
     parser.add_argument("--output", "-o", default="preproc_demo.png",
                         help="Path to save the output plot image (default: preproc_demo.png).")
-    parser.add_argument("--window-seconds", type=float, default=2.5,
-                        help="Crop window duration in seconds (default: 2.5).")
+    parser.add_argument("--window-seconds", type=float, default=2.0,
+                        help="Crop window duration in seconds (default: 2.0).")
     parser.add_argument("--dpi", type=int, default=150,
                         help="Output image DPI (default: 150).")
     return parser.parse_args(argv)

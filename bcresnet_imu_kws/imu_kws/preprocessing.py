@@ -26,8 +26,8 @@ from .dataset import TARGET_SR
 FMIN = 40.0
 FMAX = 1600.0
 N_FFT = 512
-HOP = 64           # ~19 ms @ 3333 Hz (STFT step)
-WIN_LENGTH = 128   # ~38 ms @ 3333 Hz (STFT analysis window; << old implicit 154 ms)
+HOP = 33            # ~10 ms @ 3333 Hz (STFT step)
+WIN_LENGTH = 83    # ~25 ms @ 3333 Hz (STFT analysis window; standard speech frame)
 # High-pass kills the gravity DC (~1 g) and low-frequency body motion (< ~20 Hz)
 # that otherwise dominate accel-Z. Keep it just below FMIN.
 HP_CUTOFF = 25.0
