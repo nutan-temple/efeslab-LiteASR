@@ -5,9 +5,8 @@ Numpy/scipy operations applied per clip in the dataset:
     low-frequency body motion that otherwise dominate accel-Z,
   * peak or RMS normalization (a single scalar gain; peak is the safe default,
     RMS can amplify noise on near-silent clips),
-  * optional silence trimming (energy VAD),
-  * ``crop_max_energy``: take the highest-energy fixed window (or zero-pad if the
-    clip is shorter) -> no more diluting the signal with seconds of padding.
+  * ``crop_max_energy``: take the highest-energy fixed window (or zero/repeat-pad
+    if the clip is shorter) -> no more diluting the signal with seconds of padding.
 
 All functions are sample-rate aware and produce a fixed-length 1-D float32 array
 of ``window_samples``. ``build_preproc(name, window_samples, sample_rate, ...)``
@@ -52,25 +51,6 @@ def norm_rms(x, target_rms=0.1):
     return (x * (target_rms / r)).astype(np.float32)
 
 
-def trim_silence(wav, sample_rate=TARGET_SR, frame_ms=30.0, hop_ms=10.0,
-                 energy_ratio=0.1, pad_ms=150.0):
-    n_frame = max(1, int(sample_rate * frame_ms / 1000))
-    n_hop = max(1, int(sample_rate * hop_ms / 1000))
-    if len(wav) <= n_frame:
-        return wav
-    starts = np.arange(0, len(wav) - n_frame + 1, n_hop)
-    rms = np.sqrt(np.array([(wav[s:s + n_frame] ** 2).mean() for s in starts]) + 1e-12)
-    if rms.max() <= 0:
-        return wav
-    active = np.where(rms > rms.max() * energy_ratio)[0]
-    if active.size == 0:
-        return wav
-    pad = int(sample_rate * pad_ms / 1000)
-    first = max(0, int(starts[active[0]]) - pad)
-    last = min(len(wav), int(starts[active[-1]]) + n_frame + pad)
-    return wav[first:last]
-
-
 def crop_max_energy(wav, window_samples, sample_rate=TARGET_SR, smooth_ms=25, pad_mode="zero"):
     """Return the highest-energy ``window_samples`` slice, or pad if shorter.
 
@@ -109,9 +89,6 @@ def build_preproc(name, window_samples, sample_rate=TARGET_SR,
     if name == "hp_peak_crop":
         def pp(x):
             return _crop(norm_peak(_hp(x)))
-    elif name == "hp_peak_trim_crop":
-        def pp(x):
-            return _crop(trim_silence(norm_peak(_hp(x)), sample_rate))
     elif name == "no_hp":
         def pp(x):
             return _crop(norm_peak(x))
@@ -120,8 +97,8 @@ def build_preproc(name, window_samples, sample_rate=TARGET_SR,
             return _crop(norm_rms(_hp(x), target_rms))
     else:
         raise ValueError(
-            "unknown preproc '%s' (choices: hp_peak_crop, hp_peak_trim_crop, no_hp, hp_rms_crop)" % name)
+            "unknown preproc '%s' (choices: hp_peak_crop, no_hp, hp_rms_crop)" % name)
     return pp
 
 
-PREPROC_CHOICES = ("hp_peak_crop", "hp_peak_trim_crop", "no_hp", "hp_rms_crop")
+PREPROC_CHOICES = ("hp_peak_crop", "no_hp", "hp_rms_crop")
