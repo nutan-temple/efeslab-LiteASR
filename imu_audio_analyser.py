@@ -1527,12 +1527,15 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
+  python imu_audio_analyser.py data.csv                    # Positional CSV input
   python imu_audio_analyser.py                             # Embedded sample
-  python imu_audio_analyser.py -i data.csv -o output/     # CSV input
+  python imu_audio_analyser.py -i data.csv -o output/     # CSV input (named)
   python imu_audio_analyser.py --preset full              # Full grid sweep
   python imu_audio_analyser.py --gap_mode chunk --axis z  # Gap-aware chunk mode
         """
     )
+    parser.add_argument("csv", nargs="?", default=None,
+                        help="Input CSV file (positional, optional)")
     parser.add_argument("--input", "-i", type=str, default=None,
                         help="Input CSV file (timestamp, Accel X, Accel Y, Accel Z)")
     parser.add_argument("--output_dir", "-o", type=str, default="imu_analyser_output",
@@ -1552,8 +1555,11 @@ Examples:
 
     args = parser.parse_args()
 
+    # Support both positional and named --input flag; positional takes priority
+    input_file = args.csv or args.input
+
     run_pipeline(
-        input_file=args.input,
+        input_file=input_file,
         output_dir=args.output_dir,
         target_sr=args.target_sr,
         axis=args.axis,
