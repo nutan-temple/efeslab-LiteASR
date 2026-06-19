@@ -335,7 +335,8 @@ def _prepare(cfg):
             cfg.get("window_seconds", 2.0) * sample_rate))
         preproc_fn = build_preproc(
             cfg.get("preproc", "hp_peak_crop"), window_samples, sample_rate,
-            hp_cutoff=cfg.get("hp_cutoff", 25.0))
+            hp_cutoff=cfg.get("hp_cutoff", 25.0),
+            pad_mode=cfg.get("pad_mode", "zero"))
         target_len = window_samples
         print("front-end: feature=%s preproc=%s | window=%d (~%.2fs) | HP %.0fHz | mel %.0f-%.0fHz | win_len=%d hop=%d n_fft=%d" % (
             feat_name, cfg.get("preproc", "hp_peak_crop"), window_samples,

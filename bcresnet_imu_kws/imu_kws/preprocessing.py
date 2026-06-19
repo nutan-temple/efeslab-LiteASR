@@ -71,10 +71,21 @@ def trim_silence(wav, sample_rate=TARGET_SR, frame_ms=30.0, hop_ms=10.0,
     return wav[first:last]
 
 
-def crop_max_energy(wav, window_samples, sample_rate=TARGET_SR, smooth_ms=25):
-    """Return the highest-energy ``window_samples`` slice, or center-pad if shorter."""
+def crop_max_energy(wav, window_samples, sample_rate=TARGET_SR, smooth_ms=25, pad_mode="zero"):
+    """Return the highest-energy ``window_samples`` slice, or pad if shorter.
+
+    ``pad_mode``:
+      * ``"zero"`` (default) — center zero-pad (standard).
+      * ``"repeat"`` — tile/loop the signal to fill the window (avoids silence
+        dilution for very short clips; every frame sees real content).
+    """
     win = int(window_samples)
     if len(wav) <= win:
+        if pad_mode == "repeat" and len(wav) > 0:
+            repeats = int(np.ceil(win / len(wav)))
+            wav = np.tile(wav, repeats)[:win]
+            return wav.astype(np.float32)
+        # default: center zero-pad
         pad = win - len(wav)
         return np.pad(wav, (pad // 2, pad - pad // 2)).astype(np.float32)
     k = max(1, int(smooth_ms / 1000 * sample_rate))
@@ -86,14 +97,14 @@ def crop_max_energy(wav, window_samples, sample_rate=TARGET_SR, smooth_ms=25):
 
 
 def build_preproc(name, window_samples, sample_rate=TARGET_SR,
-                  hp_cutoff=HP_CUTOFF, target_rms=0.1):
+                  hp_cutoff=HP_CUTOFF, target_rms=0.1, pad_mode="zero"):
     """Return an ``x -> x`` pipeline that outputs a fixed ``window_samples`` clip."""
 
     def _hp(x):
         return apply_hp(x, sample_rate, hp_cutoff)
 
     def _crop(x):
-        return crop_max_energy(x, window_samples, sample_rate)
+        return crop_max_energy(x, window_samples, sample_rate, pad_mode=pad_mode)
 
     if name == "hp_peak_crop":
         def pp(x):

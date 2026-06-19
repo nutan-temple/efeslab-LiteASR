@@ -81,6 +81,7 @@ def train_remote(
     n_fft: int = 512,
     hop: int = 33,
     max_folds: int = 0,
+    pad_mode: str = "zero",
     specaug: bool = True,
 ):
     import sys
@@ -129,6 +130,7 @@ def train_remote(
         n_fft=n_fft,
         hop=hop,
         max_folds=max_folds,
+        pad_mode=pad_mode,
         specaug=specaug,
         num_workers=4,
     )
