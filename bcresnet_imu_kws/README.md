@@ -151,3 +151,75 @@ modal volume get kws-imu-models bcresnet_imu/loso_summary.json
 modal volume get kws-imu-models bcresnet_imu/summary.json
 modal volume get kws-imu-models bcresnet_imu/bcresnet_imu_best.pt
 ```
+
+## Utility Scripts
+
+### csv_to_wav.py -- Convert CSV accelerometer data to WAV
+
+Reads the `accel_z` column (or any column you specify) from a CSV file and writes
+a mono `.wav` at 3333 Hz (the pipeline target sample rate). The signal is
+normalized to [-1, 1] by default.
+
+```bash
+# Basic usage (writes <input_stem>.wav next to the CSV)
+python bcresnet_imu_kws/csv_to_wav.py --input recording.csv
+
+# Specify output path and column name
+python bcresnet_imu_kws/csv_to_wav.py \
+    --input data/raw_accel.csv \
+    --output data/accel_z.wav \
+    --column accel_z
+
+# Skip normalization (keep raw amplitude)
+python bcresnet_imu_kws/csv_to_wav.py --input recording.csv --no-normalize
+```
+
+Options:
+- `--input / -i` (required): path to the input CSV
+- `--output / -o`: output WAV path (default: same stem as input + `.wav`)
+- `--column / -c`: column name to extract (default: `accel_z`)
+- `--sample-rate / -sr`: output sample rate (default: 3333)
+- `--no-normalize`: skip peak normalization to [-1, 1]
+
+### preproc_demo.py -- Preprocessing pipeline visualization
+
+Takes a single `.wav` file and runs the full IMU preprocessing pipeline
+step-by-step, producing a multi-panel plot that proves each DSP hyperparameter
+choice visually:
+
+1. Raw waveform (time domain)
+2. After high-pass Butterworth filter (HP_CUTOFF=25 Hz)
+3. After peak normalization (scaled to [-1, 1])
+4. After `crop_max_energy` (highest-energy fixed window)
+5. STFT spectrogram (annotated with Nyquist and HP cutoff lines)
+6. Log-mel spectrogram (40 bins, fmin=40 Hz, fmax=1600 Hz annotated)
+7. Per-frame energy distribution histogram
+8. Summary table of all hyperparameter values
+
+```bash
+# Basic usage (saves preproc_demo.png in the current directory)
+python bcresnet_imu_kws/preproc_demo.py --wav my_recording.wav
+
+# Custom output path and crop window
+python bcresnet_imu_kws/preproc_demo.py \
+    --wav data/accel_z.wav \
+    --output plots/pipeline_verification.png \
+    --window-seconds 2.5 \
+    --dpi 200
+```
+
+Options:
+- `--wav / -w` (required): path to the input WAV (resampled to 3333 Hz if needed)
+- `--output / -o`: output image path (default: `preproc_demo.png`)
+- `--window-seconds`: crop window duration in seconds (default: 2.5)
+- `--dpi`: output image resolution (default: 150)
+
+**Typical workflow** (CSV to verified preprocessing):
+
+```bash
+# 1) Convert your accelerometer CSV to WAV
+python bcresnet_imu_kws/csv_to_wav.py -i raw_data.csv -o signal.wav
+
+# 2) Visualize and verify the full preprocessing pipeline
+python bcresnet_imu_kws/preproc_demo.py -w signal.wav -o pipeline_check.png
+```
